@@ -30,6 +30,23 @@ Error codes seen while building this: `Terracotta / InitialConnection-149` means
 `Hopper / InitialConnection-25` means signaling was reached but the offer was refused.
 `Door / InitialConnection-142` means the answer was rejected or UDP unreachable (seen when `a=identity` was missing).
 `Kelp / InitialConnection-32` ("Application: 1") means transport is up but the game layer timed out waiting for the server.
+`Boat / InitialConnection-148` and `Block / InitialConnection-90` mean the client couldn't decode or accept a game packet.
+
+### Join sequence (working with 26.60; see `src/bedrock.rs`)
+
+Recorded from Mojang's Bedrock Dedicated Server with a gophertunnel bot, then trimmed to what's needed:
+
+- Before StartGame, send `JigsawStructureData` and `VoxelShapes` (the docs say "always before StartGamePacket").
+- After StartGame, send ItemRegistry, AvailableActorIdentifiers, AvailableCommands and CraftingData.
+- On RequestChunkRadius, send ChunkRadiusUpdated, NetworkChunkPublisherUpdate and the chunks. Send **all 24 overworld
+  sub-chunks**, or the client treats the player's own sub-chunk as unloaded. Then send the player state:
+  attributes, abilities (walk speed 0 means no movement), game type, Respawn(ready), SetActorData and MovePlayer.
+- **PlayStatus(PLAYER_SPAWN) only after the client sends ServerboundLoadingScreen(start) and about 2 s have passed.**
+  Sent any earlier, it is silently ignored. The client then stays behind its loading screen, frozen in the air,
+  although it still reports SetLocalPlayerAsInitialized. The client sends nothing while it waits, so this needs a timer
+  (`Session::poll`).
+- Dev tool: `HORIZON_BEDROCK_REPLAY=<recording>` replays a recorded BDS join stream verbatim, and
+  `HORIZON_BEDROCK_REPLAY_SKIP` drops packet ids to bisect what the client needs.
 
 If Horizon later adds server-side mods, the same code can move in-process. Nothing in the
 translation layer depends on running as a separate process.
@@ -73,7 +90,9 @@ Bedrock ships a new protocol about every 6 weeks. Keeping up with it is the main
      DTLS, SCTP), with the answer carrying a signed `a=identity` (`src/identity.rs`; without it the client
      silently drops the answer). Segmented messages are reassembled, RequestNetworkSettings is answered, and the
      client then sends Login (~588 KB with skin). Over NetherNet, batches have no 0xFE header.
-     *Still to do:* RequestNetworkSettings → NetworkSettings (compression) → Login
+     **Done (2026-11-03): a real 26.60 client joins a generated flat world and can walk, fly and break blocks.**
+     *Still to do:* identity verification, item and creative definitions (the inventory is empty), then the Java side.
+     Original plan: RequestNetworkSettings → NetworkSettings (compression) → Login
      (verify the JWT chain, read gamertag and XUID) → ECDH P-384 encryption handshake → PlayStatus →
      empty resource packs → StartGame. Java: handshake(login) → Login Start → configuration phase
      (registries, known packs) → Play Login → translate chunk data into Bedrock sub-chunks, using the

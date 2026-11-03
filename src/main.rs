@@ -5,6 +5,7 @@ mod identity;
 mod java;
 mod nethernet;
 mod webrtc;
+mod world;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;

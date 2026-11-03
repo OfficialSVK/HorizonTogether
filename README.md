@@ -2,10 +2,11 @@
 
 A Rust bridge that lets **Minecraft Bedrock Edition** players connect to a
 [Horizon](https://playhorizon.dev/) server, which speaks Java Edition 26.3. It's a native,
-Java-free take on what Geyser does. See [docs/DESIGN.md](docs/DESIGN.md) for the plan.
+Java-free take on what Geyser does.
 
-**Status:** milestone 1a. Bedrock clients see the server in their server list, with Horizon's MOTD and live
-player count. **Joining doesn't work yet** (milestone 1b).
+**Status:** Bedrock 26.60 clients join over NetherNet and can walk, fly and break blocks in a test world
+the bridge generates itself. Connecting to Horizon's real world is next, and player identities aren't verified yet,
+so keep the bridge on your own network. See [docs/STATUS.md](docs/STATUS.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Run
 
@@ -14,17 +15,15 @@ cargo run --release -- [horizon_addr] [bedrock_bind]
 # defaults: 127.0.0.1:25565  0.0.0.0:19132
 ```
 
-Then in Bedrock, go to **Play → Servers → Add Server** and enter this machine's address with port `19132`.
-Allow UDP 19132 through the firewall. Bedrock uses UDP, unlike Java's TCP.
+In Bedrock, go to **Play → Servers → Add Server**, enter this machine's address and port, then choose **Play**
+and accept the "trust" prompt. Allow the port through the firewall for **both TCP and UDP**: Bedrock 26.60
+uses HTTP over TCP to find the server and WebRTC over UDP to play.
 
-**Playing Bedrock on the same Windows PC as the bridge?** Run this once in an Administrator PowerShell,
-then restart Minecraft:
+**Playing Bedrock on the same Windows PC as the bridge?** Use a port other than 19132, then run this once in an
+Administrator PowerShell and restart Minecraft:
 `CheckNetIsolation LoopbackExempt -a -n="Microsoft.MinecraftUWP_8wekyb3d8bbwe"`.
 
-On Windows, building needs Visual Studio's C++ tools and the Windows SDK, because Rust uses the MSVC linker.
+## Contributing
 
-## Test
-
-```sh
-cargo test
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing with a real client, and how to record what
+Mojang's server sends when the client misbehaves.
