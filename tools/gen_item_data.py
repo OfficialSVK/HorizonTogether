@@ -5,6 +5,9 @@ Outputs (in <out_dir>):
   creative_content.bin  CreativeContent packet body: creative groups and items.
   java_items.bin        For each Java item id in order: Bedrock item id (i16), aux (u16), Java block state of the
                         item's block or 0xFFFFFFFF (u32), all little-endian.
+  creative_java.bin     For each creative item in order: the Java item id it gives (i32 LE, -1 when none).
+  block_properties.bin  StartGame's block properties (vanilla blocks defined data-driven), from Geyser's
+                        data_driven_blocks.nbt for the same version (read from next to item_components.nbt).
 
 Inputs:
   runtime_item_states.json, item_components.nbt, creative_items.json   GeyserMC/Geyser core/src/main/resources/bedrock
@@ -146,7 +149,10 @@ def creative_content(states, creative):
     return bytes(out)
 
 
-def java_items(states, mappings, registries):
+def java_items(states, mappings, registries, creative):
+    """The mappings keep pre-flattening aux values (spruce_planks: 1) for items Bedrock has since split into
+    their own ids; an aux is kept only where Bedrock's creative list uses that exact (item, aux) pair."""
+    used = {(it["id"], it.get("damage", 0)) for it in creative["items"]}
     java = registries["minecraft:item"]["entries"]
     ids = sorted(java, key=lambda n: java[n]["protocol_id"])
     assert [java[n]["protocol_id"] for n in ids] == list(range(len(ids))), "dense Java item ids"
@@ -158,8 +164,33 @@ def java_items(states, mappings, registries):
             missing.append(name)
             out += struct.pack("<hHI", 0, 0, 0xFFFFFFFF)
             continue
-        out += struct.pack("<hHI", bedrock["id"], m.get("bedrock_data", 0), m.get("firstBlockRuntimeId", 0xFFFFFFFF))
+        aux = m.get("bedrock_data", 0)
+        aux = aux if (m["bedrock_identifier"], aux) in used else 0
+        out += struct.pack("<hHI", bedrock["id"], aux, m.get("firstBlockRuntimeId", 0xFFFFFFFF))
     return bytes(out), len(ids), missing
+
+
+def creative_java(creative, mappings, registries):
+    """For each creative item (creative net id - 1), the Java item id it gives (i32, -1 when none)."""
+    java = registries["minecraft:item"]["entries"]
+    by_bedrock, by_name = {}, {}
+    for name in sorted(java, key=lambda n: java[n]["protocol_id"]):
+        m = mappings.get(name)
+        if m:
+            by_bedrock.setdefault((m["bedrock_identifier"], m.get("bedrock_data", 0)), java[name]["protocol_id"])
+            by_name.setdefault(m["bedrock_identifier"], java[name]["protocol_id"])
+    ids = [by_bedrock.get((it["id"], it.get("damage", 0)), by_name.get(it["id"], -1)) for it in creative["items"]]
+    missing = [it["id"] for it, i in zip(creative["items"], ids) if i < 0]
+    return b"".join(struct.pack("<i", i) for i in ids), missing
+
+
+def block_properties(blocks):
+    """StartGame's block properties: the vanilla blocks Bedrock defines data-driven (concrete stairs...), each a
+    name and its definition as network NBT, after a count."""
+    out = bytearray(uvarint(len(blocks)))
+    for name, (tag, value) in blocks.items():
+        out += string(name) + bytes([10]) + string("") + net_nbt(tag, value)
+    return bytes(out)
 
 
 def recorded(path, packet_id):
@@ -174,6 +205,8 @@ def recorded(path, packet_id):
 
 
 def main(states_path, components_path, creative_path, items_path, registries_path, out_dir, bds=None):
+    # Geyser's data_driven_blocks file for the same Bedrock version sits next to its item components.
+    blocks_path = components_path.replace("item_components", "data_driven_blocks")
     states = {s["name"]: s for s in json.load(open(states_path, encoding="utf-8"))}
     _, components = read_nbt(gzip.open(components_path).read(), False)
     creative = json.load(open(creative_path, encoding="utf-8"))
@@ -181,9 +214,14 @@ def main(states_path, components_path, creative_path, items_path, registries_pat
         "item_registry.bin": item_registry(states, components),
         "creative_content.bin": creative_content(states, creative),
     }
-    java, count, missing = java_items(states, json.load(open(items_path, encoding="utf-8")),
-                                      json.load(open(registries_path, encoding="utf-8")))
+    mappings = json.load(open(items_path, encoding="utf-8"))
+    registries = json.load(open(registries_path, encoding="utf-8"))
+    java, count, missing = java_items(states, mappings, registries, creative)
     files["java_items.bin"] = java
+    files["creative_java.bin"], no_java = creative_java(creative, mappings, registries)
+    raw = open(blocks_path, "rb").read()
+    files["block_properties.bin"] = block_properties(read_nbt(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw, False)[1])
+    print(f"{len(creative['items'])} creative items, {len(no_java)} without a Java item: {no_java[:10]}")
     for name, data in files.items():
         open(os.path.join(out_dir, name), "wb").write(data)
         print(f"{name}: {len(data)} bytes")
@@ -193,6 +231,8 @@ def main(states_path, components_path, creative_path, items_path, registries_pat
             want, got = recorded(bds, pid), files[name]
             at = next((i for i in range(min(len(want), len(got))) if want[i] != got[i]), None)
             print(f"{name} vs Mojang's server: {'identical' if want == got else f'differs at byte {at} (sizes {len(got)} / {len(want)})'}")
+        found = files["block_properties.bin"] in recorded(bds, 11)
+        print(f"block_properties.bin {'found' if found else 'NOT found'} in Mojang's StartGame")
 
 
 if __name__ == "__main__":

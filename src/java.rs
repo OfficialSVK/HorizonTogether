@@ -205,6 +205,39 @@ pub enum Command {
     UseOn { pos: [i32; 3], face: u8, cursor: [f32; 3] },
     /// Select hotbar slot 0-8.
     HeldSlot(u8),
+    /// Creative-mode inventory edit (set_creative_mode_slot): a player menu slot, or -1 to drop the item.
+    CreativeSlot { slot: i16, item: Option<Item> },
+    /// A click in the player's inventory menu (container_click, window 0): slot (-999 = outside the window),
+    /// button, mode (0 pickup, 4 throw).
+    Click { slot: i16, button: i8, mode: i32 },
+    /// Attack an entity, with the arm swing a Java client sends with every attack.
+    Attack(i32),
+    /// Use (right-click) an entity with the main hand.
+    Interact(i32),
+    /// The inventory screen closed (container_close, window 0): the server puts the cursor's items back.
+    CloseInventory,
+}
+
+/// Java Inventory index (see Event::Inventory) to the player menu slot (window 0).
+pub fn inventory_to_menu(i: u8) -> i16 {
+    match i {
+        0..=8 => 36 + i as i16,
+        36..=39 => 44 - i as i16, // feet (36) is menu slot 8, head (39) slot 5
+        40 => 45,
+        _ => i as i16,
+    }
+}
+
+/// An item stack as a Java client writes it: count, then id and an empty component patch.
+fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
+    match item {
+        Some(i) if i.count > 0 => {
+            write_varint(out, i.count as i32);
+            write_varint(out, i.id);
+            out.extend([0, 0]); // no components added or removed
+        }
+        _ => out.push(0),
+    }
 }
 
 /// What Horizon tells the bridge about the world, for the Bedrock side to translate.
@@ -231,12 +264,14 @@ pub enum Event {
     /// The overworld clock was set (join, /time): total ticks; time of day is ticks % 24000.
     Time(i64),
     /// Player inventory slots changed, by Java Inventory index: 0-8 hotbar, 9-35 main, 36-39 armor (feet to head),
-    /// 40 offhand. `all` = the whole inventory was resent.
-    Inventory { slots: Vec<(u8, Option<Item>)>, all: bool },
+    /// 40 offhand.
+    Inventory { slots: Vec<(u8, Option<Item>)> },
     /// Selected hotbar slot, 0-8.
     HeldSlot(u8),
     /// Health (0-20), food level (0-20) and saturation.
     Health { health: f32, food: i32, saturation: f32 },
+    /// The item on the inventory screen's cursor.
+    Cursor(Option<Item>),
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
     Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
@@ -683,6 +718,8 @@ pub async fn play(
     let mut names: std::collections::HashMap<[u8; 16], String> = Default::default();
     let mut tracked: std::collections::HashMap<i32, Tracked> = Default::default();
     let mut sequence = 0i32;
+    // State id of the player's inventory menu, from the server's last container_set_content/slot.
+    let mut menu_state = 0i32;
     loop {
         let (id, body) = tokio::select! {
             packet = packets.recv() => packet.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))??,
@@ -738,6 +775,35 @@ pub async fn play(
                         c.send(0x42, &m).await?; // use_item_on
                     }
                     Command::HeldSlot(slot) => c.send(0x36, &(slot as i16).to_be_bytes()).await?, // set_carried_item
+                    Command::CreativeSlot { slot, item } => {
+                        let mut m = slot.to_be_bytes().to_vec();
+                        write_item(&mut m, item);
+                        c.send(0x39, &m).await?; // set_creative_mode_slot
+                    }
+                    Command::Click { slot, button, mode } => {
+                        // No predicted slots or cursor: the server applies the click and sends back what changed.
+                        let mut m = Vec::new();
+                        write_varint(&mut m, 0); // window: the player's inventory
+                        write_varint(&mut m, menu_state);
+                        m.extend(slot.to_be_bytes());
+                        m.push(button as u8);
+                        write_varint(&mut m, mode);
+                        m.extend([0, 0]); // no changed slots, no carried item
+                        c.send(0x12, &m).await?; // container_click
+                    }
+                    Command::Attack(id) => {
+                        let mut m = Vec::new();
+                        write_varint(&mut m, id);
+                        c.send(0x01, &m).await?; // attack
+                        c.send(0x2e, &[]).await?; // punch: the arm swing
+                    }
+                    Command::Interact(id) => {
+                        let mut m = Vec::new();
+                        write_varint(&mut m, id);
+                        m.extend([0, 0, 0]); // main hand, location (0, 0, 0) as an empty LpVec3, not sneaking
+                        c.send(0x1a, &m).await?; // interact
+                    }
+                    Command::CloseInventory => c.send(0x13, &[0]).await?, // container_close, window 0
                 }
                 continue;
             }
@@ -920,7 +986,7 @@ pub async fn play(
                     if read_varint_sync(&mut r)? != 0 {
                         return Ok(()); // another container (chests come later)
                     }
-                    read_varint_sync(&mut r)?; // state id
+                    menu_state = read_varint_sync(&mut r)?;
                     if all {
                         for slot in 0..read_varint_sync(&mut r)? {
                             let item = read_item(&mut r)?;
@@ -936,7 +1002,7 @@ pub async fn play(
                 if let Err(e) = &result {
                     eprintln!("Java: inventory packet {id:#x} only partly read: {e}");
                 }
-                if !slots.is_empty() && events.send(Event::Inventory { slots, all: all && result.is_ok() }).is_err() {
+                if !slots.is_empty() && events.send(Event::Inventory { slots }).is_err() {
                     return Ok(());
                 }
             }
@@ -978,6 +1044,13 @@ pub async fn play(
                     eprintln!("Java: equipment of entity {id} only partly read: {e}");
                 }
                 if events.send(Event::Equipment { id, slots }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x62) => {
+                // set_cursor_item: what the player holds on the cursor in an inventory screen.
+                let item = read_item(&mut r)?;
+                if events.send(Event::Cursor(item)).is_err() {
                     return Ok(());
                 }
             }
@@ -1173,6 +1246,8 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let _ = cmd_tx.send(Command::Chat("hello from the bridge test".into()));
+            // In creative, a creative-slot edit comes back as the slot's new content (hotbar slot 0 = menu 36).
+            let _ = cmd_tx.send(Command::CreativeSlot { slot: 36, item: Some(Item { id: 1, count: 5 }) });
         });
         let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx)).await;
         assert!(r.is_err(), "still connected after 8 s (expected); ended early with {r:?}");
@@ -1187,10 +1262,11 @@ mod tests {
                 Event::Rain(v) => println!("rain {v}"),
                 Event::Thunder(v) => println!("thunder {v}"),
                 Event::Time(t) => println!("time {t}"),
-                Event::Inventory { slots, all } => println!("inventory (all: {all}): {slots:?}"),
+                Event::Inventory { slots } => println!("inventory: {slots:?}"),
                 Event::HeldSlot(s) => println!("held slot {s}"),
                 Event::Health { health, food, saturation } => println!("health {health} food {food} saturation {saturation}"),
                 Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
+                Event::Cursor(item) => println!("cursor {item:?}"),
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;

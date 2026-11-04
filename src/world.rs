@@ -78,6 +78,16 @@ pub fn java_item(id: i32) -> Option<(i16, u16, u32)> {
     Some((i16::from_le_bytes([e[0], e[1]]), u16::from_le_bytes([e[2], e[3]]), block))
 }
 
+/// Per creative item (creative net id - 1): the Java item id it gives, i32 LE, -1 when none (tools/gen_item_data.py).
+static CREATIVE_JAVA: &[u8] = include_bytes!("../data/creative_java.bin");
+
+/// The Java item a creative menu entry gives. shortcut: item NBT (potion types, enchanted books) isn't carried over.
+pub fn creative_java(net_id: u32) -> Option<i32> {
+    let i = (net_id as usize).checked_sub(1)? * 4;
+    let id = i32::from_le_bytes(CREATIVE_JAVA.get(i..i + 4)?.try_into().unwrap());
+    (id >= 0).then_some(id)
+}
+
 /// Converts the section data of a Java 26.3 chunk packet (24 overworld sections, y = -64..320) into a Bedrock
 /// LevelChunk payload. Returns (sub-chunk count, payload).
 /// shortcut: every biome becomes plains; real biomes need the Java biome registry mapped to Bedrock ids.
@@ -210,6 +220,10 @@ mod tests {
         let (id, aux, block) = java_item(1).unwrap();
         assert_eq!((id, aux, block), (1, 0, block_hash("minecraft:stone")), "stone is Bedrock item 1, a block");
         assert!(java_item(-1).is_none() && java_item(1 << 20).is_none());
+        // Creative entry 1 is oak planks (CreativeContent's first item), which round-trips through Java.
+        let planks = creative_java(1).expect("oak planks");
+        assert_eq!(java_item(planks).map(|(_, aux, b)| (aux, b)), Some((0, block_hash("minecraft:oak_planks"))));
+        assert!(creative_java(0).is_none() && creative_java(1 << 20).is_none());
     }
 
     /// One Java section: blocks as a 4-bit palette [air, stone] with stone only at y=0, biome single value.

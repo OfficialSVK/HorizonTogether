@@ -4,6 +4,8 @@
 //! Packet layouts: Mojang's bedrock-protocol-docs (release v1.26.60, protocol 2225), cross-checked
 //! against gophertunnel (MIT) for exact primitive encodings.
 
+mod inventory;
+
 const LOGIN: u32 = 1;
 const PLAY_STATUS: u32 = 2;
 const RESOURCE_PACKS_INFO: u32 = 6;
@@ -49,9 +51,15 @@ const MOB_ARMOR_EQUIPMENT: u32 = 32;
 const PLAYER_HOTBAR: u32 = 48;
 const INVENTORY_CONTENT: u32 = 49;
 const INVENTORY_SLOT: u32 = 50;
-/// Bedrock container ids of the player's armor and offhand (the inventory is 0).
+/// Bedrock container ids of the player's armor and offhand (the inventory is 0), and the UI (cursor) container.
 const ARMOR: u32 = 120;
 const OFFHAND: u32 = 119;
+const UI_CONTAINER: u32 = 124;
+const INTERACT: u32 = 33;
+const CONTAINER_OPEN: u32 = 46;
+const CONTAINER_CLOSE: u32 = 47;
+const ITEM_STACK_REQUEST: u32 = 147;
+const ITEM_STACK_RESPONSE: u32 = 148;
 const SET_TIME: u32 = 10;
 const INVENTORY_TRANSACTION: u32 = 30;
 /// PlayerAuthInput flags that add optional sections after the fixed fields.
@@ -115,6 +123,9 @@ pub struct Session {
     last_click: Option<([i32; 3], u32, std::time::Instant)>,
     /// What other players hold and wear, by Java entity id and Java equipment slot (0-5).
     equipment: std::collections::HashMap<i32, [Option<crate::java::Item>; 6]>,
+    /// The inventory screen's cursor, and the creative menu's output slot (the item just picked from it).
+    cursor: Option<crate::java::Item>,
+    created: Option<crate::java::Item>,
 }
 
 impl Default for Session {
@@ -141,6 +152,8 @@ impl Default for Session {
             net_id: 0,
             last_click: None,
             equipment: Default::default(),
+            cursor: None,
+            created: None,
         }
     }
 }
@@ -371,6 +384,33 @@ impl Session {
                         self.to_java.push(crate::java::Command::HeldSlot(self.held));
                     }
                 }
+                // Interact action 6: the player pressed the inventory key. The client only opens its own inventory
+                // screen when the server answers with ContainerOpen (window 0, type -1 = the player's inventory).
+                INTERACT if packet.first() == Some(&6) => {
+                    let mut w = W::default();
+                    let [x, y, z] = self.pos.map(|v| v.floor() as i32);
+                    w.u8(0).u8(0xFF).varint(x).varint(y).varint(z).varint64(1); // our unique id
+                    out.push(self.batch(&[packet_bytes(CONTAINER_OPEN, &w.0)]));
+                }
+                INTERACT => {} // mouse over an entity, leave a vehicle
+                // ContainerClose from the client: window, type, server-side. It waits for the server's own close.
+                CONTAINER_CLOSE => {
+                    let (window, kind) = (*packet.first().unwrap_or(&0), *packet.get(1).unwrap_or(&0));
+                    out.push(self.batch(&[packet_bytes(CONTAINER_CLOSE, &[window, kind, 0])]));
+                    if self.linked && window == 0 {
+                        self.to_java.push(crate::java::Command::CloseInventory); // the cursor's items go back
+                    }
+                }
+                ITEM_STACK_REQUEST if self.linked && self.spawn_status_sent => {
+                    let raw = packet;
+                    match inventory::read_requests(&mut packet) {
+                        Ok(requests) => {
+                            let response = self.stack_requests(requests);
+                            out.push(self.batch(&[response]));
+                        }
+                        Err(e) => eprintln!("Bedrock: can't read item stack request ({e}): {:02x?}", &raw[..raw.len().min(64)]),
+                    }
+                }
                 // PlayerAction: runtime id, action, block position, result position, face.
                 PLAYER_ACTION if self.linked && self.spawn_status_sent => {
                     read_uvarint128(&mut packet)?;
@@ -382,9 +422,14 @@ impl Session {
                 }
                 INVENTORY_TRANSACTION if self.linked && self.spawn_status_sent => {
                     let raw = packet;
-                    match read_item_use_transaction(&mut packet) {
-                        Ok(Some(u)) => self.item_use(u, "InventoryTransaction"),
-                        Ok(None) => {} // shortcut: other transactions (attacking, dropping) aren't forwarded yet
+                    match read_transaction(&mut packet) {
+                        Ok(Transaction::Use(u)) => self.item_use(u, "InventoryTransaction"),
+                        Ok(Transaction::OnEntity { target, attack }) if target >= 2 => {
+                            let id = (target - 2) as i32; // entity_id(): Java id + 2
+                            self.to_java.push(if attack { crate::java::Command::Attack(id) } else { crate::java::Command::Interact(id) });
+                        }
+                        Ok(Transaction::Drop(n)) => self.drop_held(n),
+                        Ok(_) => {}
                         Err(e) => eprintln!("Bedrock: can't read inventory transaction ({e}): {:02x?}", &raw[..raw.len().min(64)]),
                     }
                 }
@@ -506,17 +551,26 @@ impl Session {
                 let p = packet_bytes(SET_TIME, &W::default().varint(ticks as i32).0);
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
-            crate::java::Event::Inventory { slots, all } => {
-                for &(i, item) in &slots {
-                    self.inventory[i as usize] = item;
+            // Only what differs from Bedrock's view is sent: Horizon echoes the slots Bedrock itself just changed.
+            crate::java::Event::Inventory { slots } => {
+                for (i, item) in slots {
+                    if self.inventory[i as usize] != item {
+                        self.inventory[i as usize] = item;
+                        if self.spawned {
+                            packets.push(self.inventory_slot(i)); // before spawn, all of it goes with the spawn packets
+                        }
+                    }
                 }
-                if !self.spawned {
-                    // sent with the spawn packets
-                } else if all {
-                    packets.extend(self.inventory_contents());
-                } else {
-                    for (i, _) in slots {
-                        packets.push(self.inventory_slot(i));
+            }
+            crate::java::Event::Cursor(item) => {
+                if self.cursor != item {
+                    self.cursor = item;
+                    if self.spawned {
+                        let mut w = W::default();
+                        w.varuint(UI_CONTAINER).varuint(0).bool(false).bool(false); // the cursor is UI slot 0
+                        self.net_id += 1;
+                        write_stack(&mut w, item, Some(self.net_id));
+                        packets.push(packet_bytes(INVENTORY_SLOT, &w.0));
                     }
                 }
             }
@@ -647,6 +701,18 @@ impl Session {
         }
     }
 
+    /// Items dropped from the held hotbar slot (Q): Java's drop-one (player_action 3) per item, or drop-stack (4).
+    fn drop_held(&mut self, n: u32) {
+        let held = self.held as usize;
+        let Some(item) = self.inventory[held] else { return };
+        let all = n >= item.count as u32;
+        let (status, times) = if all { (4, 1) } else { (3, n) };
+        for _ in 0..times {
+            self.to_java.push(crate::java::Command::Dig { status, pos: [0, 0, 0], face: 0 });
+        }
+        self.inventory[held] = (!all).then(|| crate::java::Item { count: item.count - n as u8, ..item }); // Bedrock already shows it
+    }
+
     /// A Bedrock block action (server-authoritative breaking) as Java digging. Java creative breaks on "start";
     /// survival needs "start", then "finish" once the block is predicted broken.
     fn block_action(&mut self, action: i32, pos: [i32; 3], face: i32) {
@@ -770,7 +836,10 @@ fn start_game() -> Vec<u8> {
     // end of LevelSettings
     w.string("").string("Horizon").string("").bool(false); // level id, level name, template content identity, trial
     w.varint(0).bool(true); // movement settings: rewind history size, server-authoritative block breaking (as Geyser)
-    w.bytes(&0i64.to_le_bytes()).varint(0).varuint(0); // current time, enchantment seed, no custom block properties
+    w.bytes(&0i64.to_le_bytes()).varint(0); // current time, enchantment seed
+    // Block properties: the vanilla blocks Bedrock defines data-driven (concrete stairs, slabs, walls...), as
+    // Mojang's server sends them (tools/gen_item_data.py). Without them the client has no such blocks or items.
+    w.bytes(include_bytes!("../data/block_properties.bin"));
     // Multiplayer correlation id: gophertunnel sends a random UUID; any unique string will do.
     let correlation = format!("{:032x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
     w.string(&correlation).bool(true).string(crate::BEDROCK_VERSION); // correlation id, item stack net manager, server version
@@ -1147,14 +1216,21 @@ fn skip_legacy_slots(r: &mut &[u8]) -> Result<(), String> {
 /// NetworkItemStackDescriptor: id (i16), count (u16), aux, has-net-id bool [+ net id], block runtime id, user data.
 /// Empty is 8 bytes. Layout from gophertunnel's ItemInstance, matching Mojang's server.
 fn skip_item(r: &mut &[u8]) -> Result<(), String> {
-    take(r, 4)?;
+    read_stack(r).map(|_| ())
+}
+
+/// A NetworkItemStackDescriptor's Bedrock item id and count; the rest is read past.
+fn read_stack(r: &mut &[u8]) -> Result<(i16, u16), String> {
+    let id = i16::from_le_bytes(take(r, 2)?.try_into().unwrap());
+    let count = u16::from_le_bytes(take(r, 2)?.try_into().unwrap());
     read_uvarint(r)?; // aux
     if take(r, 1)?[0] != 0 {
         read_uvarint(r)?; // stack net id
     }
     read_uvarint(r)?; // block runtime id
     let n = read_uvarint(r)? as usize;
-    take(r, n).map(|_| ())
+    take(r, n)?; // user data
+    Ok((id, count))
 }
 
 /// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
@@ -1188,10 +1264,12 @@ struct ItemUse {
     click: [f32; 3],
 }
 
-/// Item-use transaction data after the legacy fields (gophertunnel's InventoryAction / UseItemTransactionData).
-fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
+/// A transaction's inventory actions (gophertunnel's InventoryAction); returns how many items went to the world
+/// (a drop shows as a world-interaction source receiving them).
+fn read_inventory_actions(r: &mut &[u8]) -> Result<u32, String> {
+    let mut dropped = 0;
     for _ in 0..read_uvarint(r)? {
-        read_uvarint(r)?; // source type
+        let source = read_uvarint(r)?;
         if read_bool(r)? {
             take(r, 1)?; // window id (i8)
         }
@@ -1200,8 +1278,48 @@ fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
         }
         read_uvarint(r)?; // slot
         skip_item(r)?; // old item
-        skip_item(r)?; // new item
+        let (_, count) = read_stack(r)?; // new item
+        if source == 2 {
+            dropped += count as u32;
+        }
     }
+    Ok(dropped)
+}
+
+/// What an InventoryTransaction asks for.
+enum Transaction {
+    /// A click on a block (type 2).
+    Use(ItemUse),
+    /// Attack (or use, `attack` false) another entity: its runtime id (type 3).
+    OnEntity { target: u64, attack: bool },
+    /// Items dropped from the hotbar (Q) (type 0, normal).
+    Drop(u32),
+    Other,
+}
+
+fn read_transaction(r: &mut &[u8]) -> Result<Transaction, String> {
+    read_uvarint(r)?; // legacy request id
+    skip_legacy_slots(r)?;
+    Ok(match read_uvarint(r)? {
+        0 => match read_inventory_actions(r)? {
+            0 => Transaction::Other,
+            n => Transaction::Drop(n),
+        },
+        2 => Transaction::Use(read_item_use(r)?),
+        3 => {
+            // UseItemOnEntity: actions, runtime id, action (0 interact, 1 attack), hotbar slot, hand, item, positions.
+            read_inventory_actions(r)?;
+            let target = read_uvarint128(r)? as u64;
+            let action = zigzag(read_uvarint(r)?);
+            Transaction::OnEntity { target, attack: action == 1 }
+        }
+        _ => Transaction::Other,
+    })
+}
+
+/// Item-use transaction data after the legacy fields (gophertunnel's InventoryAction / UseItemTransactionData).
+fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
+    read_inventory_actions(r)?;
     let action = zigzag(read_uvarint(r)?);
     let trigger = take(r, 1)?[0] as u32;
     let pos = read_block_pos(r)?;
@@ -1217,16 +1335,6 @@ fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
     read_uvarint(r)?; // target block runtime id
     take(r, 2)?; // client prediction, cooldown state
     Ok(ItemUse { action, trigger, pos, face, click })
-}
-
-/// InventoryTransaction: the item-use transaction (type 2), if it is one.
-fn read_item_use_transaction(r: &mut &[u8]) -> Result<Option<ItemUse>, String> {
-    read_uvarint(r)?; // legacy request id
-    skip_legacy_slots(r)?;
-    if read_uvarint(r)? != 2 {
-        return Ok(None);
-    }
-    read_item_use(r).map(Some)
 }
 
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
@@ -1319,9 +1427,21 @@ mod tests {
         p.extend([0; 12]); // player position
         p.extend(0.5f32.to_le_bytes().into_iter().chain(1f32.to_le_bytes()).chain(0.25f32.to_le_bytes()));
         p.extend([0, 0, 0]); // block runtime id, prediction, cooldown
-        let u = read_item_use_transaction(&mut &p[..]).unwrap().expect("item use");
+        let Ok(Transaction::Use(u)) = read_transaction(&mut &p[..]) else { panic!("item use") };
         assert_eq!((u.action, u.trigger, u.pos, u.face, u.click), (0, 1, [192, 66, 60], 1, [0.5, 1.0, 0.25]));
         assert_eq!(read_input_flags(&mut &[2, 100, 70][..]).unwrap(), 1 << 50 | 1 << 35, "VerticalCollision, PerformBlockActions");
+    }
+
+    #[test]
+    fn opens_and_closes_the_inventory() {
+        let mut s = Session { linked: true, pos: [1.5, 70.0, -2.5], ..Default::default() };
+        // Interact: open inventory (6), runtime id 1, no position.
+        let open = s.on_message(&[4, INTERACT as u8, 6, 1, 0]).unwrap();
+        // One batch: ContainerOpen, window 0, type -1, block (1, 70, -3) zigzag, unique id 1 (zigzag 2).
+        assert_eq!(open, [vec![8, CONTAINER_OPEN as u8, 0, 0xFF, 2, 140, 1, 5, 2]]);
+        let close = s.on_message(&[4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]).unwrap();
+        assert_eq!(close, [vec![4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]]);
+        assert!(matches!(s.take_to_java()[..], [crate::java::Command::CloseInventory]));
     }
 
     #[test]
