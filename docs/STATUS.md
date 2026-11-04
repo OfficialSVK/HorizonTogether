@@ -1,4 +1,4 @@
-﻿# Status
+# Status
 
 *Last updated 2026-11-04.* Architecture and protocol notes are in [DESIGN.md](DESIGN.md). What's next is in [ROADMAP.md](ROADMAP.md).
 
