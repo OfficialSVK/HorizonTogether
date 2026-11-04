@@ -9,7 +9,9 @@ const PLAY_STATUS: u32 = 2;
 const RESOURCE_PACKS_INFO: u32 = 6;
 const RESOURCE_PACK_STACK: u32 = 7;
 const RESOURCE_PACK_CLIENT_RESPONSE: u32 = 8;
+const TEXT: u32 = 9;
 const START_GAME: u32 = 11;
+const COMMAND_REQUEST: u32 = 77;
 const MOVE_PLAYER: u32 = 19;
 const SET_ACTOR_DATA: u32 = 39;
 const RESPAWN: u32 = 45;
@@ -298,6 +300,20 @@ impl Session {
                     self.to_java.push(crate::java::Command::TickEnd);
                 }
                 PLAYER_AUTH_INPUT => {}
+                // Text: needs-translation, category, type; type 1 (chat) carries sender then message.
+                TEXT if self.linked && packet.get(2) == Some(&1) => {
+                    let mut r = &packet[3..];
+                    let n = read_uvarint(&mut r)? as usize;
+                    take(&mut r, n)?; // sender: the player's own name
+                    let n = read_uvarint(&mut r)? as usize;
+                    let message = String::from_utf8_lossy(take(&mut r, n)?).into_owned();
+                    self.to_java.push(crate::java::Command::Chat(message));
+                }
+                COMMAND_REQUEST if self.linked => {
+                    let n = read_uvarint(&mut packet)? as usize;
+                    let line = String::from_utf8_lossy(take(&mut packet, n)?).into_owned();
+                    self.to_java.push(crate::java::Command::Run(line.trim_start_matches('/').to_string()));
+                }
                 SERVERBOUND_LOADING_SCREEN => {
                     let kind = zigzag(read_uvarint(&mut packet)?);
                     println!("Bedrock: client loading screen {}", ["unknown", "start", "end"].get(kind as usize).unwrap_or(&"?"));
@@ -355,6 +371,10 @@ impl Session {
                     packets.push(packet_bytes(UPDATE_ABILITIES, &abilities(mode)));
                 }
             }
+            crate::java::Event::Chat { from, text, overlay } if !text.is_empty() => {
+                packets.push(packet_bytes(TEXT, &text_packet(from.as_deref(), &text, overlay)));
+            }
+            crate::java::Event::Chat { .. } => {}
             crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data) {
                 Ok((count, payload)) => {
                     let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
@@ -514,6 +534,18 @@ fn player_metadata() -> Vec<u8> {
     w.meta(53, FLOAT).f32(0.6); // bounding box width
     w.meta(54, FLOAT).f32(1.8); // bounding box height
     w.varuint(0).varuint(0).varuint64(0); // no synced int/float properties, input tick
+    w.0
+}
+
+/// Text packet: a player's chat (type 1, authored) when there is a sender, else raw (0) or tip (5, the action bar).
+fn text_packet(from: Option<&str>, text: &str, overlay: bool) -> Vec<u8> {
+    let mut w = W::default();
+    w.bool(false); // not a translation key
+    match from.filter(|f| !f.is_empty()) {
+        Some(name) => w.u8(1).u8(1).string(name).string(text), // authored message, chat
+        None => w.u8(0).u8(if overlay { 5 } else { 0 }).string(text), // message only, raw or tip
+    };
+    w.string("").string("").bool(false); // XUID, platform chat id, no filtered message
     w.0
 }
 

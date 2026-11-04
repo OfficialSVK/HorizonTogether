@@ -195,6 +195,10 @@ pub enum Command {
     Move { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool },
     /// The player's tick ended (sent every tick, as a Java client does).
     TickEnd,
+    /// A chat message.
+    Chat(String),
+    /// A command, without the leading `/`.
+    Run(String),
 }
 
 /// What Horizon tells the bridge about the world, for the Bedrock side to translate.
@@ -205,6 +209,140 @@ pub enum Event {
     Chunk { x: i32, z: i32, data: Vec<u8> },
     /// Java game mode: 0 survival, 1 creative, 2 adventure, 3 spectator.
     GameMode(u8),
+    /// A chat line: `from` is the sender for player chat, `None` for system messages; overlay = action bar.
+    Chat { from: Option<String>, text: String, overlay: bool },
+}
+
+/// Just enough of an NBT tree to flatten text components.
+enum Nbt {
+    Str(String),
+    Compound(Vec<(String, Nbt)>),
+    List(Vec<Nbt>),
+    Other,
+}
+
+/// Reads a network NBT tag (Java 1.20.2+: type byte, then the payload with no root name).
+fn read_nbt(r: &mut &[u8]) -> io::Result<Nbt> {
+    let t = take_bytes(r, 1)?[0];
+    read_nbt_payload(r, t, 0)
+}
+
+fn take_bytes<'a>(r: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
+    let head = r.get(..n).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated NBT"))?;
+    *r = &r[n..];
+    Ok(head)
+}
+
+fn read_nbt_payload(r: &mut &[u8], t: u8, depth: u32) -> io::Result<Nbt> {
+    if depth > 64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "NBT nested too deep"));
+    }
+    let len = |r: &mut &[u8]| -> io::Result<usize> { Ok(i32::from_be_bytes(take_bytes(r, 4)?.try_into().unwrap()).max(0) as usize) };
+    let string = |r: &mut &[u8]| -> io::Result<String> {
+        let n = u16::from_be_bytes(take_bytes(r, 2)?.try_into().unwrap()) as usize;
+        Ok(String::from_utf8_lossy(take_bytes(r, n)?).into_owned())
+    };
+    Ok(match t {
+        1 => take_bytes(r, 1).map(|_| Nbt::Other)?,
+        2 => take_bytes(r, 2).map(|_| Nbt::Other)?,
+        3 | 5 => take_bytes(r, 4).map(|_| Nbt::Other)?,
+        4 | 6 => take_bytes(r, 8).map(|_| Nbt::Other)?,
+        7 => { let n = len(r)?; take_bytes(r, n).map(|_| Nbt::Other)? }
+        8 => Nbt::Str(string(r)?),
+        9 => {
+            let et = take_bytes(r, 1)?[0];
+            let n = len(r)?;
+            Nbt::List((0..n).map(|_| read_nbt_payload(r, et, depth + 1)).collect::<io::Result<_>>()?)
+        }
+        10 => {
+            let mut fields = Vec::new();
+            loop {
+                let ft = take_bytes(r, 1)?[0];
+                if ft == 0 {
+                    break Nbt::Compound(fields);
+                }
+                let name = string(r)?;
+                fields.push((name, read_nbt_payload(r, ft, depth + 1)?));
+            }
+        }
+        11 => { let n = len(r)?; take_bytes(r, n * 4).map(|_| Nbt::Other)? }
+        12 => { let n = len(r)?; take_bytes(r, n * 8).map(|_| Nbt::Other)? }
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad NBT tag")),
+    })
+}
+
+/// Plain text of a component: `text`, `translate` (common keys rendered, others as their arguments), `extra`.
+fn component_text(c: &Nbt) -> String {
+    fn field<'a>(fields: &'a [(String, Nbt)], k: &str) -> Option<&'a Nbt> {
+        fields.iter().find(|(n, _)| n == k).map(|(_, v)| v)
+    }
+    match c {
+        Nbt::Str(s) => s.clone(),
+        Nbt::List(items) => items.iter().map(component_text).collect(),
+        Nbt::Compound(f) => {
+            let mut s = match (field(f, "text"), field(f, "translate")) {
+                (Some(t), _) => component_text(t),
+                (None, Some(Nbt::Str(key))) => {
+                    let args: Vec<String> = match field(f, "with") {
+                        Some(Nbt::List(a)) => a.iter().map(component_text).collect(),
+                        _ => Vec::new(),
+                    };
+                    let template = match key.as_str() {
+                        "chat.type.text" => "<%s> %s",
+                        "chat.type.announcement" => "[%s] %s",
+                        "chat.type.emote" => "* %s %s",
+                        "multiplayer.player.joined" => "%s joined the game",
+                        "multiplayer.player.left" => "%s left the game",
+                        // shortcut: other keys show their arguments only; full text needs the language files.
+                        _ => return args.join(" ") + &extra_text(f),
+                    };
+                    args.iter().fold(template.to_string(), |t, a| t.replacen("%s", a, 1))
+                }
+                _ => String::new(),
+            };
+            s += &extra_text(f);
+            s
+        }
+        Nbt::Other => String::new(),
+    }
+}
+
+fn extra_text(f: &[(String, Nbt)]) -> String {
+    match f.iter().find(|(n, _)| n == "extra") {
+        Some((_, Nbt::List(items))) => items.iter().map(component_text).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Sender name and text of player_chat: global index, sender, index, signature?, content, timestamp, salt,
+/// last seen [id (0 = a full 256-byte signature follows)], unsigned content?, filter mask, chat type, name.
+async fn player_chat(mut r: &[u8]) -> io::Result<(String, String)> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "short player_chat");
+    read_varint(&mut r).await?;
+    r = r.get(16..).ok_or_else(bad)?;
+    read_varint(&mut r).await?;
+    if take_bytes(&mut r, 1)?[0] != 0 {
+        r = r.get(256..).ok_or_else(bad)?;
+    }
+    let n = read_varint(&mut r).await? as usize;
+    let mut text = String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned();
+    r = r.get(16..).ok_or_else(bad)?;
+    for _ in 0..read_varint(&mut r).await?.min(20) {
+        if read_varint(&mut r).await? == 0 {
+            r = r.get(256..).ok_or_else(bad)?;
+        }
+    }
+    if take_bytes(&mut r, 1)?[0] != 0 {
+        text = component_text(&read_nbt(&mut r)?); // the server's own rendering wins
+    }
+    if read_varint(&mut r).await? == 2 {
+        let longs = read_varint(&mut r).await? as usize; // partially filtered: a bit set follows
+        r = r.get(longs * 8..).ok_or_else(bad)?;
+    }
+    if read_varint(&mut r).await? == 0 {
+        return Ok((String::new(), text)); // inline chat type: rare; skip the name rather than parse it
+    }
+    Ok((component_text(&read_nbt(&mut r)?), text))
 }
 
 /// Game mode from the play login packet: entity id, hardcore, dimension names, max players, view and simulation
@@ -291,6 +429,21 @@ pub async fn play(
                     }
                     // The server allows one position per client tick and kicks on a second (invalid_player_movement).
                     Command::TickEnd => c.send(0x0d, &[]).await?, // client_tick_end
+                    Command::Chat(msg) => {
+                        // Unsigned chat (offline server): message, timestamp, salt, no signature, nothing seen.
+                        let mut m = Vec::new();
+                        write_string(&mut m, &msg.chars().take(256).collect::<String>());
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                        m.extend((now.as_millis() as i64).to_be_bytes());
+                        m.extend(0i64.to_be_bytes());
+                        m.extend([0, 0, 0, 0, 0, 0]); // no signature, offset 0, 20-bit seen set (3 bytes), checksum 0
+                        c.send(0x09, &m).await?;
+                    }
+                    Command::Run(cmd) => {
+                        let mut m = Vec::new();
+                        write_string(&mut m, &cmd);
+                        c.send(0x07, &m).await?; // chat_command (unsigned)
+                    }
                 }
                 continue;
             }
@@ -339,6 +492,24 @@ pub async fn play(
                 // game_event 3 = change game mode; the mode is the f32 parameter.
                 let mode = body.get(1..5).map(|b| f32::from_be_bytes(b.try_into().unwrap()) as u8).unwrap_or(0);
                 if events.send(Event::GameMode(mode)).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x7c | 0x42 | 0x21) => {
+                let chat = match id {
+                    0x7c => Event::Chat { from: None, text: component_text(&read_nbt(&mut r)?), overlay: r.first() == Some(&1) },
+                    0x42 => {
+                        let (from, text) = player_chat(r).await?;
+                        Event::Chat { from: Some(from), text, overlay: false }
+                    }
+                    _ => {
+                        // disguised_chat: message, chat type (registry id + 1, 0 = inline), name.
+                        let text = component_text(&read_nbt(&mut r)?);
+                        let from = if read_varint(&mut r).await? != 0 { component_text(&read_nbt(&mut r)?) } else { String::new() };
+                        Event::Chat { from: Some(from), text, overlay: false }
+                    }
+                };
+                if events.send(chat).is_err() {
                     return Ok(());
                 }
             }
@@ -403,6 +574,35 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
+    /// Network NBT for {translate: "multiplayer.player.joined", with: [{text: "Alex"}]}.
+    fn joined_nbt() -> Vec<u8> {
+        let s = |v: &mut Vec<u8>, t: &str| {
+            v.extend((t.len() as u16).to_be_bytes());
+            v.extend(t.as_bytes());
+        };
+        let mut v = vec![10, 8];
+        s(&mut v, "translate");
+        s(&mut v, "multiplayer.player.joined");
+        v.push(9);
+        s(&mut v, "with");
+        v.extend([10, 0, 0, 0, 1, 8]); // list of 1 compound; first field: string
+        s(&mut v, "text");
+        s(&mut v, "Alex");
+        v.extend([0, 0]); // end of the list's compound, end of root
+        v
+    }
+
+    #[test]
+    fn flattens_nbt_components() {
+        let nbt = joined_nbt();
+        let mut r = &nbt[..];
+        assert_eq!(component_text(&read_nbt(&mut r).unwrap()), "Alex joined the game");
+        assert!(r.is_empty(), "whole tag consumed");
+        let mut plain = &[8u8, 0, 2, b'h', b'i'][..];
+        assert_eq!(component_text(&read_nbt(&mut plain).unwrap()), "hi");
+        assert!(read_nbt(&mut &nbt[..5]).is_err(), "truncated NBT is an error");
+    }
+
     #[test]
     fn java_names() {
         assert_eq!(java_name("Sergiy22889917"), ".Sergiy22889917");
@@ -425,6 +625,7 @@ mod tests {
                 let _ = cmd_tx.send(Command::TickEnd);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            let _ = cmd_tx.send(Command::Chat("hello from the bridge test".into()));
         });
         let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx)).await;
         assert!(r.is_err(), "still connected after 8 s (expected); ended early with {r:?}");
@@ -433,6 +634,7 @@ mod tests {
         for e in rx.try_iter() {
             match e {
                 Event::GameMode(m) => println!("game mode {m}"),
+                Event::Chat { from, text, .. } => println!("chat from {from:?}: {text}"),
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;
