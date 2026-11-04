@@ -44,12 +44,19 @@ const VOXEL_SHAPES: u32 = 337;
 const PLAYER_AUTH_INPUT: u32 = 144;
 const UPDATE_BLOCK: u32 = 21;
 const LEVEL_EVENT: u32 = 25;
+const MOB_EQUIPMENT: u32 = 31;
+const MOB_ARMOR_EQUIPMENT: u32 = 32;
+const PLAYER_HOTBAR: u32 = 48;
+const INVENTORY_CONTENT: u32 = 49;
+const INVENTORY_SLOT: u32 = 50;
+/// Bedrock container ids of the player's armor and offhand (the inventory is 0).
+const ARMOR: u32 = 120;
+const OFFHAND: u32 = 119;
 const SET_TIME: u32 = 10;
 const INVENTORY_TRANSACTION: u32 = 30;
 /// PlayerAuthInput flags that add optional sections after the fixed fields.
 const PERFORM_ITEM_INTERACTION: u128 = 1 << 34;
 const PERFORM_BLOCK_ACTIONS: u128 = 1 << 35;
-const PERFORM_ITEM_STACK_REQUEST: u128 = 1 << 36;
 /// PlayerActionType values used in PlayerAuthInput block actions.
 const START_DESTROY_BLOCK: i32 = 0;
 const ABORT_DESTROY_BLOCK: i32 = 1;
@@ -98,6 +105,16 @@ pub struct Session {
     replay: Option<()>,
     /// Block the player started digging (Horizon was sent "start digging" for it).
     breaking: Option<[i32; 3]>,
+    /// Horizon's view of the player inventory, by Java Inventory index (see java::Event::Inventory).
+    inventory: [Option<crate::java::Item>; 41],
+    /// Selected hotbar slot.
+    held: u8,
+    /// Last item stack network id handed out; each sent stack gets a new one.
+    net_id: i32,
+    /// Last block click forwarded to Horizon: position, face, when.
+    last_click: Option<([i32; 3], u32, std::time::Instant)>,
+    /// What other players hold and wear, by Java entity id and Java equipment slot (0-5).
+    equipment: std::collections::HashMap<i32, [Option<crate::java::Item>; 6]>,
 }
 
 impl Default for Session {
@@ -119,6 +136,11 @@ impl Default for Session {
             logged: Default::default(),
             replay: None,
             breaking: None,
+            inventory: [None; 41],
+            held: 0,
+            net_id: 0,
+            last_click: None,
+            equipment: Default::default(),
         }
     }
 }
@@ -248,7 +270,8 @@ impl Session {
                             packet_bytes(JIGSAW_STRUCTURE_DATA, &jigsaw.0),
                             packet_bytes(VOXEL_SHAPES, &voxel.0), // "should always be sent before StartGamePacket"
                             packet_bytes(START_GAME, &start_game()),
-                            packet_bytes(ITEM_REGISTRY, &[0]), // shortcut: no item definitions yet
+                            // Every item with its components (tools/gen_item_data.py; identical to Mojang's server).
+                            packet_bytes(ITEM_REGISTRY, include_bytes!("../data/item_registry.bin")),
                             // Vanilla entity types, including minecraft:player (see data/README.md).
                             packet_bytes(AVAILABLE_ACTOR_IDENTIFIERS, include_bytes!("../data/entity_identifiers.dat")),
                             // PocketMine sends both before spawn: no commands, no recipes (8 and 11 empty lists).
@@ -282,7 +305,8 @@ impl Session {
                         }
                     }
                     if !self.spawned {
-                        packets.push(packet_bytes(CREATIVE_CONTENT, &[0, 0])); // no groups, no items
+                        packets.push(packet_bytes(CREATIVE_CONTENT, include_bytes!("../data/creative_content.bin")));
+                        packets.extend(self.inventory_contents());
                         // What dragonfly/Geyser send for the local player at spawn.
                         packets.push(packet_bytes(UPDATE_ATTRIBUTES, &player_attributes()));
                         packets.push(packet_bytes(UPDATE_ABILITIES, &abilities(self.game_mode)));
@@ -307,9 +331,9 @@ impl Session {
                 PLAYER_AUTH_INPUT if self.linked && self.spawn_status_sent => {
                     let f = |i: usize| packet.get(i..i + 4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).ok_or("short PlayerAuthInput");
                     let (pitch, yaw, x, y, z) = (f(0)?, f(4)?, f(8)?, f(12)? - 1.62, f(16)?);
-                    // The input flag set follows pitch, yaw, position, move vector and head yaw.
+                    // The input flags follow pitch, yaw, position, move vector and head yaw.
                     let mut rest = packet.get(32..).ok_or("short PlayerAuthInput")?;
-                    let flags = read_uvarint128(&mut rest)?;
+                    let flags = read_input_flags(&mut rest)?;
                     if [x, y, z] != self.pos || [pitch, yaw] != self.rot {
                         let chunk = |p: [f32; 3]| (p[0].floor() as i32 >> 4, p[2].floor() as i32 >> 4);
                         let new_chunk = chunk([x, y, z]) != chunk(self.pos);
@@ -324,13 +348,28 @@ impl Session {
                             out.push(self.batch(&[self.publisher()])); // keep accepting Horizon's chunks around us
                         }
                     }
-                    if flags & PERFORM_BLOCK_ACTIONS != 0 {
-                        match read_block_actions(&mut rest, flags) {
-                            Ok(actions) => actions.into_iter().for_each(|(a, pos, face)| self.block_action(a, pos, face)),
-                            Err(e) => eprintln!("Bedrock: can't read block actions: {e}"),
+                    if flags & (PERFORM_ITEM_INTERACTION | PERFORM_BLOCK_ACTIONS) != 0 {
+                        match read_auth_input_extras(&mut rest) {
+                            Ok((item_use, actions)) => {
+                                if let Some(u) = item_use {
+                                    self.item_use(u, "PlayerAuthInput");
+                                }
+                                actions.into_iter().for_each(|(a, pos, face)| self.block_action(a, pos, face));
+                            }
+                            Err(e) => eprintln!("Bedrock: can't read PlayerAuthInput item use / block actions: {e}"),
                         }
                     }
                     self.to_java.push(crate::java::Command::TickEnd);
+                }
+                // MobEquipment: runtime id, item, slot, selected slot, container. Hotbar changes go to Horizon.
+                MOB_EQUIPMENT if self.linked && self.spawn_status_sent => {
+                    read_uvarint128(&mut packet)?;
+                    skip_item(&mut packet)?;
+                    let (_, selected, container) = (read_uvarint(&mut packet)?, read_uvarint(&mut packet)?, read_uvarint(&mut packet)?);
+                    if container == 0 && selected < 9 && selected as u8 != self.held {
+                        self.held = selected as u8;
+                        self.to_java.push(crate::java::Command::HeldSlot(self.held));
+                    }
                 }
                 // PlayerAction: runtime id, action, block position, result position, face.
                 PLAYER_ACTION if self.linked && self.spawn_status_sent => {
@@ -341,15 +380,14 @@ impl Session {
                     let face = zigzag(read_uvarint(&mut packet)?);
                     self.block_action(action, pos, face);
                 }
-                INVENTORY_TRANSACTION if self.linked && self.spawn_status_sent => match read_click(&mut packet) {
-                    Ok(Some(u)) => {
-                        println!("Bedrock: clicked block {:?} face {} at {:?} -> Horizon", u.pos, u.face, u.click);
-                        let face = u.face.min(5) as u8;
-                        self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
+                INVENTORY_TRANSACTION if self.linked && self.spawn_status_sent => {
+                    let raw = packet;
+                    match read_item_use_transaction(&mut packet) {
+                        Ok(Some(u)) => self.item_use(u, "InventoryTransaction"),
+                        Ok(None) => {} // shortcut: other transactions (attacking, dropping) aren't forwarded yet
+                        Err(e) => eprintln!("Bedrock: can't read inventory transaction ({e}): {:02x?}", &raw[..raw.len().min(64)]),
                     }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("Bedrock: can't read inventory transaction: {e}"),
-                },
+                }
                 PLAYER_AUTH_INPUT => {}
                 // Text: needs-translation, category, type; type 1 (chat) carries sender then message.
                 TEXT if self.linked && packet.get(2) == Some(&1) => {
@@ -450,6 +488,7 @@ impl Session {
             }
             crate::java::Event::MoveEntity { .. } => {}
             crate::java::Event::RemoveEntity { id, uuid } => {
+                self.equipment.remove(&id);
                 packets.push(packet_bytes(REMOVE_ACTOR, &W::default().varint64(entity_id(id) as i64).0));
                 let mut list = W::default();
                 list.varuint(1).varuint(0).u8(1).bytes(&bedrock_uuid(&uuid)); // one entry: remove
@@ -466,6 +505,70 @@ impl Session {
             crate::java::Event::Time(ticks) => {
                 let p = packet_bytes(SET_TIME, &W::default().varint(ticks as i32).0);
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            crate::java::Event::Inventory { slots, all } => {
+                for &(i, item) in &slots {
+                    self.inventory[i as usize] = item;
+                }
+                if !self.spawned {
+                    // sent with the spawn packets
+                } else if all {
+                    packets.extend(self.inventory_contents());
+                } else {
+                    for (i, _) in slots {
+                        packets.push(self.inventory_slot(i));
+                    }
+                }
+            }
+            // shortcut: no Bedrock death screen; the bridge respawns the player on Horizon at once (java.rs), so the
+            // health shown never reaches 0.
+            crate::java::Event::Health { health, food, saturation } => {
+                let p = packet_bytes(UPDATE_ATTRIBUTES, &attributes(&[
+                    ("minecraft:health", 0.0, 20.0, health.clamp(1.0, 20.0)),
+                    ("minecraft:player.hunger", 0.0, 20.0, food as f32),
+                    ("minecraft:player.saturation", 0.0, 20.0, saturation),
+                ]));
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            crate::java::Event::Equipment { id, slots } => {
+                let worn = self.equipment.entry(id).or_default();
+                let mut hands = Vec::new();
+                for &(slot, item) in &slots {
+                    if let Some(s) = worn.get_mut(slot as usize) {
+                        *s = item;
+                    }
+                    if slot <= 1 {
+                        hands.push((slot, item));
+                    }
+                }
+                let worn = *worn;
+                let rid = entity_id(id);
+                let mut out = Vec::new();
+                for (slot, item) in hands {
+                    // MobEquipment: runtime id, item, inventory slot, hotbar slot, window (0 inventory, 119 offhand).
+                    let mut w = W::default();
+                    w.varuint64(rid);
+                    write_stack(&mut w, item, None);
+                    w.u8(0).u8(0).u8(if slot == 0 { 0 } else { OFFHAND as u8 });
+                    out.push(packet_bytes(MOB_EQUIPMENT, &w.0));
+                }
+                if slots.iter().any(|&(s, _)| (2..=5).contains(&s)) {
+                    // MobArmorEquipment: head, chest, legs, feet (Java slots 5, 4, 3, 2), body.
+                    let mut w = W::default();
+                    w.varuint64(rid);
+                    for s in [5, 4, 3, 2] {
+                        write_stack(&mut w, worn[s], None);
+                    }
+                    w.bytes(&[0; 8]);
+                    out.push(packet_bytes(MOB_ARMOR_EQUIPMENT, &w.0));
+                }
+                if self.spawned { packets.extend(out) } else { self.pending.extend(out) }
+            }
+            crate::java::Event::HeldSlot(slot) => {
+                self.held = slot;
+                if self.spawned {
+                    packets.push(hotbar(slot));
+                }
             }
             crate::java::Event::Block { pos, state } => {
                 // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
@@ -496,6 +599,52 @@ impl Session {
         w.varint(self.pos[0].floor() as i32).varint(self.pos[1].floor() as i32).varint(self.pos[2].floor() as i32);
         w.varuint(self.radius as u32 * 16).bytes(&0u32.to_le_bytes()); // radius in blocks, no saved chunks
         packet_bytes(NETWORK_CHUNK_PUBLISHER_UPDATE, &w.0)
+    }
+
+    /// InventoryContent for the inventory, armor and offhand containers, then the selected hotbar slot.
+    fn inventory_contents(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for (container, range) in [(0, 0..36), (ARMOR, 36..40), (OFFHAND, 40..41)] {
+            let mut w = W::default();
+            w.varuint(container).varuint(range.len() as u32);
+            let slots: Vec<u8> = if container == ARMOR { range.rev().collect() } else { range.collect() };
+            for i in slots {
+                self.net_id += 1;
+                write_stack(&mut w, self.inventory[i as usize], Some(self.net_id));
+            }
+            w.u8(0).bool(false).bytes(&[0; 8]); // container name (as Mojang's server), no dynamic id, no storage item
+            out.push(packet_bytes(INVENTORY_CONTENT, &w.0));
+        }
+        out.push(hotbar(self.held));
+        out
+    }
+
+    /// InventorySlot for one Java Inventory index.
+    fn inventory_slot(&mut self, i: u8) -> Vec<u8> {
+        let (container, slot) = match i {
+            0..=35 => (0, i as u32),
+            36..=39 => (ARMOR, 39 - i as u32), // Java feet..head, Bedrock head..feet
+            _ => (OFFHAND, 0),
+        };
+        let mut w = W::default();
+        // Unlike InventoryContent, the container name and storage item are optional here: absent.
+        w.varuint(container).varuint(slot).bool(false).bool(false);
+        self.net_id += 1;
+        write_stack(&mut w, self.inventory[i as usize], Some(self.net_id));
+        packet_bytes(INVENTORY_SLOT, &w.0)
+    }
+
+    /// An item use from the client: a player-input click on a block face ("place") becomes Java use_item_on, which
+    /// places the held block or uses the clicked one (doors, levers).
+    fn item_use(&mut self, u: ItemUse, from: &str) {
+        // The same click may be reported by both packets; forward it once. Trigger 2 repeats while the button is held.
+        let recent = self.last_click.is_some_and(|(pos, face, t)| (pos, face) == (u.pos, u.face) && t.elapsed().as_millis() < 100);
+        if u.action == 0 && u.trigger == 1 && !recent {
+            println!("Bedrock: click on block {:?} face {} via {from} -> Horizon", u.pos, u.face);
+            self.last_click = Some((u.pos, u.face, std::time::Instant::now()));
+            let face = u.face.min(5) as u8;
+            self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
+        }
     }
 
     /// A Bedrock block action (server-authoritative breaking) as Java digging. Java creative breaks on "start";
@@ -635,7 +784,7 @@ fn start_game() -> Vec<u8> {
 
 /// UpdateAttributes for the local player: vanilla defaults for movement, health, food and XP.
 fn player_attributes() -> Vec<u8> {
-    let attrs: [(&str, f32, f32, f32); 7] = [
+    attributes(&[
         // (name, min, max, value)
         ("minecraft:movement", 0.0, f32::MAX, 0.1),
         ("minecraft:health", 0.0, 20.0, 20.0),
@@ -644,10 +793,14 @@ fn player_attributes() -> Vec<u8> {
         ("minecraft:player.exhaustion", 0.0, 5.0, 0.0),
         ("minecraft:player.level", 0.0, 24791.0, 0.0),
         ("minecraft:player.experience", 0.0, 1.0, 0.0),
-    ];
+    ])
+}
+
+/// UpdateAttributes for the local player: (name, min, max, value) each.
+fn attributes(attrs: &[(&str, f32, f32, f32)]) -> Vec<u8> {
     let mut w = W::default();
     w.varuint64(1).varuint(attrs.len() as u32); // our player's runtime id
-    for (name, min, max, value) in attrs {
+    for &(name, min, max, value) in attrs {
         w.f32(min).f32(max).f32(value).f32(min).f32(max).f32(value); // current, then defaults
         w.string(name).varuint(0); // no modifiers
     }
@@ -690,9 +843,21 @@ fn bedrock_uuid(java: &[u8; 16]) -> [u8; 16] {
 /// Skin for a Java player: offline servers send none, and Mojang's default skins can't be bundled, so a plain
 /// two-tone skin coloured from the UUID. shortcut: real skins need the profile's textures URL fetched and decoded.
 fn generated_skin(w: &mut W, uuid: &[u8; 16]) {
-    let colour = [uuid[0] | 0x40, uuid[1] | 0x40, uuid[2] | 0x40, 255];
-    let face = [0xD8, 0xA0, 0x80, 255];
-    let image: Vec<u8> = (0..64 * 64).flat_map(|i| if i / 64 < 16 { face } else { colour }).collect(); // top rows: head
+    let shirt = [uuid[0] | 0x40, uuid[1] | 0x40, uuid[2] | 0x40, 255];
+    let trousers = [shirt[0] / 3, shirt[1] / 3, shirt[2] / 3, 255];
+    let skin = [0xD8, 0xA0, 0x80, 255];
+    // Standard 64x64 layout: base parts opaque, the outer layers (hat, jacket, sleeves, trouser legs) transparent.
+    let image: Vec<u8> = (0..64 * 64)
+        .flat_map(|i| {
+            let (x, y) = (i % 64, i / 64);
+            match (y / 16, x) {
+                (0, 0..=31) => skin,                       // head
+                (1, 0..=15) | (3, 16..=31) => trousers,    // legs
+                (1, 16..=55) | (3, 32..=47) => shirt,      // body, arms
+                _ => [0; 4],                               // outer layers and unused space
+            }
+        })
+        .collect();
     let patch = br#"{"geometry":{"default":"geometry.humanoid.custom"}}"#;
     w.string(&format!("horizon-{:02x}{:02x}", uuid[14], uuid[15])); // skin id
     w.varuint(patch.len() as u32).bytes(patch);
@@ -743,6 +908,11 @@ fn move_entity(id: u64, pos: [f64; 3], pitch: f32, yaw: f32, head_yaw: f32) -> V
     w.varuint64(id).f32(pos[0] as f32).f32(pos[1] as f32 + 1.62).f32(pos[2] as f32);
     w.f32(pitch).f32(yaw).f32(head_yaw).u8(0).bool(true).varuint64(0).bool(false).varuint64(0);
     packet_bytes(MOVE_PLAYER, &w.0)
+}
+
+/// PlayerHotbar: select a hotbar slot of the inventory.
+fn hotbar(slot: u8) -> Vec<u8> {
+    packet_bytes(PLAYER_HOTBAR, &W::default().varuint(slot as u32).u8(0).bool(true).0)
 }
 
 /// LevelEvent starting (strength 0..1 scaled to 0..65535) or stopping rain or thunder. Event ids from gophertunnel:
@@ -908,23 +1078,53 @@ fn read_block_pos(r: &mut &[u8]) -> Result<[i32; 3], String> {
     Ok([zigzag(read_uvarint(r)?), zigzag(read_uvarint(r)?), zigzag(read_uvarint(r)?)])
 }
 
-/// The rest of PlayerAuthInput after the input flags, up to and including this tick's block actions
-/// as (PlayerActionType, position, face).
-fn read_block_actions(r: &mut &[u8], flags: u128) -> Result<Vec<(i32, [i32; 3], i32)>, String> {
+/// Block actions as (PlayerActionType, position, face).
+type BlockActions = Vec<(i32, [i32; 3], i32)>;
+
+/// PlayerAuthInput's input flags (26.x): a list of flag ids (count, then zigzag varints) as a bit set.
+fn read_input_flags(r: &mut &[u8]) -> Result<u128, String> {
+    let n = read_uvarint(r)?;
+    if n > 128 {
+        return Err(format!("{n} input flags"));
+    }
+    let mut flags = 0u128;
+    for _ in 0..n {
+        if let Ok(bit) = u32::try_from(zigzag(read_uvarint(r)?)) {
+            flags |= 1u128.checked_shl(bit).unwrap_or(0);
+        }
+    }
+    Ok(flags)
+}
+
+/// The rest of PlayerAuthInput after the input flags, up to this tick's item use and block actions. Since 26.x
+/// these are optionals (a presence bool each), as in gophertunnel's PlayerAuthInput.
+fn read_auth_input_extras(r: &mut &[u8]) -> Result<(Option<ItemUse>, BlockActions), String> {
     for _ in 0..3 {
         read_uvarint(r)?; // input mode, play mode, interaction model
     }
     take(r, 8)?; // interact rotation
     read_uvarint128(r)?; // client tick
     take(r, 12)?; // position delta
-    if flags & PERFORM_ITEM_INTERACTION != 0 {
+    let item_use = if read_bool(r)? {
+        read_uvarint(r)?; // legacy request id
         skip_legacy_slots(r)?;
-        read_item_use(r)?;
+        Some(read_item_use(r)?)
+    } else {
+        None
+    };
+    if read_bool(r)? {
+        // shortcut: item stack requests aren't decoded yet (inventory moves); the block actions after one are lost.
+        return Ok((item_use, Vec::new()));
     }
-    if flags & PERFORM_ITEM_STACK_REQUEST != 0 {
-        // shortcut: item stack requests aren't decoded; they come with inventory support.
-        return Err("item stack request before the block actions".into());
-    }
+    let actions = if read_bool(r)? { read_block_actions(r)? } else { Vec::new() };
+    Ok((item_use, actions))
+}
+
+fn read_bool(r: &mut &[u8]) -> Result<bool, String> {
+    Ok(take(r, 1)?[0] != 0)
+}
+
+fn read_block_actions(r: &mut &[u8]) -> Result<BlockActions, String> {
     let n = read_uvarint(r)?;
     if n > 100 {
         return Err(format!("{n} block actions"));
@@ -932,11 +1132,11 @@ fn read_block_actions(r: &mut &[u8], flags: u128) -> Result<Vec<(i32, [i32; 3], 
     (0..n).map(|_| Ok((zigzag(read_uvarint(r)?), read_block_pos(r)?, zigzag(read_uvarint(r)?)))).collect()
 }
 
-/// Legacy item stack request id, then its container slot list when the id is set.
+/// Optional legacy set-slot list (after the legacy request id): presence bool, then (container u8, slot bytes)s.
 fn skip_legacy_slots(r: &mut &[u8]) -> Result<(), String> {
-    if read_uvarint(r)? != 0 {
+    if read_bool(r)? {
         for _ in 0..read_uvarint(r)? {
-            read_uvarint(r)?; // container
+            take(r, 1)?; // container
             let n = read_uvarint(r)? as usize;
             take(r, n)?; // slots
         }
@@ -944,14 +1144,37 @@ fn skip_legacy_slots(r: &mut &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// NetworkItemStackDescriptor: id (i16), count (u16), aux, net id, block runtime id, user data. Empty is 8 bytes.
+/// NetworkItemStackDescriptor: id (i16), count (u16), aux, has-net-id bool [+ net id], block runtime id, user data.
+/// Empty is 8 bytes. Layout from gophertunnel's ItemInstance, matching Mojang's server.
 fn skip_item(r: &mut &[u8]) -> Result<(), String> {
     take(r, 4)?;
-    for _ in 0..3 {
-        read_uvarint(r)?;
+    read_uvarint(r)?; // aux
+    if take(r, 1)?[0] != 0 {
+        read_uvarint(r)?; // stack net id
     }
+    read_uvarint(r)?; // block runtime id
     let n = read_uvarint(r)? as usize;
     take(r, n).map(|_| ())
+}
+
+/// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
+const SHIELD: i16 = 358;
+
+/// A Java item as a Bedrock NetworkItemStackDescriptor; inventory stacks carry a stack net id.
+fn write_stack(w: &mut W, item: Option<crate::java::Item>, net_id: Option<i32>) {
+    let Some((item, (id, aux, block))) = item.and_then(|i| Some((i, crate::world::java_item(i.id)?))) else {
+        w.bytes(&[0; 8]); // empty
+        return;
+    };
+    w.bytes(&id.to_le_bytes()).bytes(&(item.count as u16).to_le_bytes()).varuint(aux as u32);
+    match net_id {
+        Some(id) => w.bool(true).varint(id),
+        None => w.bool(false),
+    };
+    w.varuint(block);
+    // User data: no NBT, no can-place-on / can-destroy lists (and a blocking tick for shields).
+    let len = if id == SHIELD { 18 } else { 10 };
+    w.varuint(len).bytes(&[0; 18][..len as usize]);
 }
 
 struct ItemUse {
@@ -965,21 +1188,26 @@ struct ItemUse {
     click: [f32; 3],
 }
 
+/// Item-use transaction data after the legacy fields (gophertunnel's InventoryAction / UseItemTransactionData).
 fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
     for _ in 0..read_uvarint(r)? {
-        if matches!(read_uvarint(r)?, 0 | 2 | 99999) {
-            read_uvarint(r)?; // container id, or world-interaction flags
+        read_uvarint(r)?; // source type
+        if read_bool(r)? {
+            take(r, 1)?; // window id (i8)
+        }
+        if read_bool(r)? {
+            read_uvarint(r)?; // source flags
         }
         read_uvarint(r)?; // slot
-        skip_item(r)?;
-        skip_item(r)?;
+        skip_item(r)?; // old item
+        skip_item(r)?; // new item
     }
     let action = zigzag(read_uvarint(r)?);
-    let trigger = read_uvarint(r)?;
+    let trigger = take(r, 1)?[0] as u32;
     let pos = read_block_pos(r)?;
-    let face = read_uvarint(r)?;
+    let face = take(r, 1)?[0] as u32;
     read_uvarint(r)?; // hotbar slot
-    read_uvarint(r)?; // hand
+    take(r, 1)?; // hand
     skip_item(r)?;
     take(r, 12)?; // player position
     let mut click = [0f32; 3];
@@ -991,14 +1219,14 @@ fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
     Ok(ItemUse { action, trigger, pos, face, click })
 }
 
-/// InventoryTransaction: a player-input click on a block (item-use transaction, type 2, action "place").
-fn read_click(r: &mut &[u8]) -> Result<Option<ItemUse>, String> {
+/// InventoryTransaction: the item-use transaction (type 2), if it is one.
+fn read_item_use_transaction(r: &mut &[u8]) -> Result<Option<ItemUse>, String> {
+    read_uvarint(r)?; // legacy request id
     skip_legacy_slots(r)?;
     if read_uvarint(r)? != 2 {
         return Ok(None);
     }
-    let u = read_item_use(r)?;
-    Ok((u.action == 0 && u.trigger == 1).then_some(u))
+    read_item_use(r).map(Some)
 }
 
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
@@ -1064,14 +1292,72 @@ mod tests {
         p.extend([0; 8]); // interact rotation
         p.push(1); // tick
         p.extend([0; 12]); // position delta
-        // item use: no legacy id, no actions, destroy (zigzag 2), player input, block 0,0,0, face 1, slot, hand,
-        // empty item, player position, click position, target block, prediction, cooldown
-        p.extend([0, 0, 4, 1, 0, 0, 0, 1, 0, 0]);
+        // item use present: legacy id 0, no legacy slots, no actions, destroy (zigzag 2), player input, block 0,0,0,
+        // face 1, hotbar slot, hand, empty item, player position, click position, target block, prediction, cooldown
+        p.extend([1, 0, 0, 0, 4, 1, 0, 0, 0, 1, 0, 0]);
         p.extend([0; 8 + 12 + 12 + 1 + 2]);
-        // one block action: predict destroy (26) at (-2, 67, 25), face 1
-        p.extend([1, 52, 3, 0x86, 0x01, 50, 2]);
-        let actions = read_block_actions(&mut &p[..], PERFORM_ITEM_INTERACTION | PERFORM_BLOCK_ACTIONS).unwrap();
+        p.push(0); // no item stack request
+        // block actions present: predict destroy (26) at (-2, 67, 25), face 1
+        p.extend([1, 1, 52, 3, 0x86, 0x01, 50, 2]);
+        let (item_use, actions) = read_auth_input_extras(&mut &p[..]).unwrap();
         assert_eq!(actions, [(PREDICT_DESTROY_BLOCK, [-2, 67, 25], 1)]);
+        let u = item_use.expect("item use");
+        assert_eq!((u.action, u.trigger, u.pos, u.face), (2, 1, [0, 0, 0], 1));
+    }
+
+    #[test]
+    fn reads_a_real_placement() {
+        // InventoryTransaction from a 26.60 client placing stone from hotbar slot 2 (captured up to the block
+        // position's y; the rest follows the same layout).
+        let stone = |count: u8| [&[1, 0, count, 0, 0, 0, 0xa1, 0x9c, 0xc4, 0x81, 0x08, 0x0a][..], &[0; 10]].concat();
+        let mut p = vec![0xef, 0x04, 1, 1, 0x1d, 1, 2, 2, 1, 0, 1, 0, 0, 2];
+        p.extend(stone(64));
+        p.extend(stone(63));
+        p.extend([0, 1, 0x80, 0x03, 0x84, 0x01]); // place, player input, x 192, y 66
+        p.extend([0x78, 1, 4, 0]); // z 60, face up, hotbar slot 2, main hand
+        p.extend(stone(63));
+        p.extend([0; 12]); // player position
+        p.extend(0.5f32.to_le_bytes().into_iter().chain(1f32.to_le_bytes()).chain(0.25f32.to_le_bytes()));
+        p.extend([0, 0, 0]); // block runtime id, prediction, cooldown
+        let u = read_item_use_transaction(&mut &p[..]).unwrap().expect("item use");
+        assert_eq!((u.action, u.trigger, u.pos, u.face, u.click), (0, 1, [192, 66, 60], 1, [0.5, 1.0, 0.25]));
+        assert_eq!(read_input_flags(&mut &[2, 100, 70][..]).unwrap(), 1 << 50 | 1 << 35, "VerticalCollision, PerformBlockActions");
+    }
+
+    #[test]
+    fn other_players_equipment() {
+        use crate::java::{Event, Item};
+        let mut s = Session { spawned: true, ..Default::default() };
+        let stone = Some(Item { id: 1, count: 1 });
+        let held = s.on_java(Event::Equipment { id: 5, slots: vec![(0, stone)] });
+        // MobEquipment for runtime id 7 (Java 5 + 2): the stack without a net id, then slots and window 0.
+        let mut want = vec![MOB_EQUIPMENT as u8, 7, 1, 0, 1, 0, 0, 0];
+        write_uvarint(&mut want, crate::world::block_hash("minecraft:stone"));
+        want.push(10);
+        want.extend([0; 10]);
+        want.extend([0, 0, 0]);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0], [&[want.len() as u8][..], &want].concat(), "one batch: length, packet");
+        let armor = s.on_java(Event::Equipment { id: 5, slots: vec![(5, stone)] }); // a stone "helmet"
+        assert_eq!(armor.len(), 1);
+        assert_eq!(armor[0][1..4], [MOB_ARMOR_EQUIPMENT as u8, 7, 1], "helmet first");
+        assert_eq!(armor[0].len(), 1 + 2 + 22 + 8 * 4, "helmet, then empty chest, legs, feet and body");
+        s.on_java(Event::RemoveEntity { id: 5, uuid: [0; 16] });
+        assert!(s.equipment.is_empty());
+    }
+
+    #[test]
+    fn inventory_slot_layout() {
+        let mut s = Session::default();
+        s.inventory[0] = Some(crate::java::Item { id: 1, count: 64 }); // stone
+        let p = s.inventory_slot(0);
+        // id, container 0, slot 0, no container name, no storage item, then the stack: item 1 (i16), count 64 (u16),
+        // aux 0, has net id, net id 1 (zigzag), block id, user data (10 bytes).
+        let mut want = vec![INVENTORY_SLOT as u8, 0, 0, 0, 0, 1, 0, 64, 0, 0, 1, 2];
+        write_uvarint(&mut want, crate::world::block_hash("minecraft:stone"));
+        want.push(10);
+        want.extend([0; 10]);
+        assert_eq!(p, want);
     }
 
     #[test]
@@ -1132,9 +1418,13 @@ mod tests {
         assert_eq!(first.iter().filter(|&&i| i == LEVEL_CHUNK).count(), 25, "radius 2 = 5x5 chunks");
         assert!(!first.contains(&PLAY_STATUS), "spawn status waits for the client's loading screen");
         assert_eq!(
-            first[first.len() - 8..],
+            first[first.len() - 12..],
             [
                 CREATIVE_CONTENT,
+                INVENTORY_CONTENT, // inventory
+                INVENTORY_CONTENT, // armor
+                INVENTORY_CONTENT, // offhand
+                PLAYER_HOTBAR,
                 UPDATE_ATTRIBUTES,
                 UPDATE_ABILITIES,
                 UPDATE_ADVENTURE_SETTINGS,
@@ -1180,12 +1470,7 @@ mod tests {
         for v in [10.0f32, 90.0, 1.5, 71.62, -3.5, 0.0, 0.0, 0.0] {
             input.extend(v.to_le_bytes()); // pitch, yaw, eye position, move vector, head yaw
         }
-        let mut flags = 1u128 << 50; // VerticalCollision
-        while flags >= 0x80 {
-            input.push(flags as u8 | 0x80);
-            flags >>= 7;
-        }
-        input.push(flags as u8);
+        input.extend([1, 100]); // input flags: one, VerticalCollision (50, zigzag)
         let p = packet_bytes(PLAYER_AUTH_INPUT, &input);
         let mut b = vec![0xFF];
         write_uvarint(&mut b, p.len() as u32);

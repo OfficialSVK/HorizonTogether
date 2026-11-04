@@ -203,6 +203,8 @@ pub enum Command {
     Dig { status: i32, pos: [i32; 3], face: u8 },
     /// Right-click on a block face with the main hand; cursor is the hit point within the block (0..1).
     UseOn { pos: [i32; 3], face: u8, cursor: [f32; 3] },
+    /// Select hotbar slot 0-8.
+    HeldSlot(u8),
 }
 
 /// What Horizon tells the bridge about the world, for the Bedrock side to translate.
@@ -228,6 +230,94 @@ pub enum Event {
     Thunder(f32),
     /// The overworld clock was set (join, /time): total ticks; time of day is ticks % 24000.
     Time(i64),
+    /// Player inventory slots changed, by Java Inventory index: 0-8 hotbar, 9-35 main, 36-39 armor (feet to head),
+    /// 40 offhand. `all` = the whole inventory was resent.
+    Inventory { slots: Vec<(u8, Option<Item>)>, all: bool },
+    /// Selected hotbar slot, 0-8.
+    HeldSlot(u8),
+    /// Health (0-20), food level (0-20) and saturation.
+    Health { health: f32, food: i32, saturation: f32 },
+    /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
+    /// 4 chest, 5 head) and item.
+    Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
+}
+
+/// A Java item stack. shortcut: data components are read past, not kept (no damage, names or enchantments on
+/// Bedrock yet).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Item {
+    pub id: i32,
+    pub count: u8,
+}
+
+/// Java item stack: count, then item id and data-component patch (added, then removed component types).
+/// Component values have no length prefix, so an unknown one ends the read with an error.
+fn read_item(r: &mut &[u8]) -> io::Result<Option<Item>> {
+    let count = read_varint_sync(r)?;
+    if count <= 0 {
+        return Ok(None);
+    }
+    let id = read_varint_sync(r)?;
+    let (added, removed) = (read_varint_sync(r)?, read_varint_sync(r)?);
+    for _ in 0..added {
+        skip_component(r)?;
+    }
+    for _ in 0..removed {
+        read_varint_sync(r)?;
+    }
+    Ok(Some(Item { id, count: count.min(255) as u8 }))
+}
+
+/// Skips one added data component (type id, then value). Ids from the 26.3 data_component_type registry.
+fn skip_component(r: &mut &[u8]) -> io::Result<()> {
+    match read_varint_sync(r)? {
+        1 | 2 | 3 | 12 | 19 | 48 => drop(read_varint_sync(r)?), // max stack size, max damage, damage, rarity, repair cost, map id
+        4 | 20 | 22 | 120 => {}                                    // unbreakable, creative slot lock, intangible projectile, waxed
+        0 | 6 | 9 => drop(read_nbt(r)?),                           // custom data, custom name, item name
+        10 => {
+            let n = read_varint_sync(r)? as usize;
+            take_bytes(r, n)?; // item model
+        }
+        11 => {
+            for _ in 0..read_varint_sync(r)? {
+                read_nbt(r)?; // lore lines
+            }
+        }
+        13 | 45 => {
+            for _ in 0..read_varint_sync(r)? {
+                read_varint_sync(r)?; // enchantment
+                read_varint_sync(r)?; // level
+            }
+        }
+        21 => drop(take_bytes(r, 1)?), // enchantment glint override
+        47 => drop(take_bytes(r, 4)?), // dyed colour
+        t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("item data component {t} not decoded yet"))),
+    }
+    Ok(())
+}
+
+fn read_varint_sync(r: &mut &[u8]) -> io::Result<i32> {
+    let mut v = 0u32;
+    for i in 0..5 {
+        let b = take_bytes(r, 1)?[0];
+        v |= ((b & 0x7f) as u32) << (7 * i);
+        if b & 0x80 == 0 {
+            return Ok(v as i32);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"))
+}
+
+/// Player inventory menu (window 0) slot to Java Inventory index: 5-8 armor (head first), 9-35 main, 36-44 hotbar,
+/// 45 offhand. The crafting grid (0-4) has no Inventory index.
+fn menu_to_inventory(slot: i32) -> Option<u8> {
+    match slot {
+        5..=8 => Some((44 - slot) as u8),
+        9..=35 => Some(slot as u8),
+        36..=44 => Some((slot - 36) as u8),
+        45 => Some(40),
+        _ => None,
+    }
 }
 
 /// set_time (26.3): game time (i64), then changed world clocks `[varint clock id, varlong ticks, f32 partial tick,
@@ -461,6 +551,16 @@ fn component_text(c: &Nbt) -> String {
                         "commands.time.set" => "Set the time to %s",
                         "commands.gamemode.success.self" => "Set own game mode to %s",
                         "commands.gamemode.success.other" => "Set %s's game mode to %s",
+                        "death.attack.fall" => "%s hit the ground too hard",
+                        "death.fell.accident.generic" => "%s fell from a high place",
+                        "death.attack.generic" => "%s died",
+                        "death.attack.player" | "death.attack.mob" => "%s was slain by %s",
+                        "death.attack.outOfWorld" => "%s fell out of the world",
+                        "death.attack.drown" => "%s drowned",
+                        "death.attack.lava" => "%s tried to swim in lava",
+                        "death.attack.inFire" | "death.attack.onFire" => "%s burned to death",
+                        "death.attack.starve" => "%s starved to death",
+                        "death.attack.genericKill" | "death.attack.kill" => "%s was killed",
                         // shortcut: other keys show their arguments only; full text needs the language files.
                         _ => return args.join(" ") + &extra_text(f),
                     };
@@ -637,6 +737,7 @@ pub async fn play(
                         write_varint(&mut m, sequence);
                         c.send(0x42, &m).await?; // use_item_on
                     }
+                    Command::HeldSlot(slot) => c.send(0x36, &(slot as i16).to_be_bytes()).await?, // set_carried_item
                 }
                 continue;
             }
@@ -804,6 +905,88 @@ pub async fn play(
                     return Ok(());
                 }
             }
+            (State::Game, 0x12 | 0x14 | 0x6e) => {
+                // container_set_content / container_set_slot (window 0 = the player's inventory menu: window id,
+                // state id, then all slots or one i16 slot), set_player_inventory (Inventory index, item).
+                let mut slots = Vec::new();
+                let all = id == 0x12;
+                let result: io::Result<()> = (|| {
+                    if id == 0x6e {
+                        let slot = read_varint_sync(&mut r)?;
+                        let item = read_item(&mut r)?;
+                        slots.extend(u8::try_from(slot).ok().filter(|s| *s <= 40).map(|s| (s, item)));
+                        return Ok(());
+                    }
+                    if read_varint_sync(&mut r)? != 0 {
+                        return Ok(()); // another container (chests come later)
+                    }
+                    read_varint_sync(&mut r)?; // state id
+                    if all {
+                        for slot in 0..read_varint_sync(&mut r)? {
+                            let item = read_item(&mut r)?;
+                            slots.extend(menu_to_inventory(slot).map(|s| (s, item)));
+                        }
+                    } else {
+                        let slot = i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap());
+                        let item = read_item(&mut r)?;
+                        slots.extend(menu_to_inventory(slot as i32).map(|s| (s, item)));
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = &result {
+                    eprintln!("Java: inventory packet {id:#x} only partly read: {e}");
+                }
+                if !slots.is_empty() && events.send(Event::Inventory { slots, all: all && result.is_ok() }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x6a) => {
+                // set_health: health, food, saturation.
+                let health = read_f32(&mut r)?;
+                let food = read_varint_sync(&mut r)?;
+                let saturation = read_f32(&mut r)?;
+                if events.send(Event::Health { health, food, saturation }).is_err() {
+                    return Ok(());
+                }
+            }
+            // respawn: the server waits for player_loaded again (sent after the next player_position).
+            (State::Game, 0x54) => loaded = false,
+            (State::Game, 0x45) => {
+                // player_combat_kill: player id, death message. This is what opens a Java client's death screen,
+                // once the server counts the player dead; the bridge presses "Respawn" at once (client_command 0).
+                // Sent earlier (on set_health 0) the server ignores it, as the player isn't dead yet.
+                read_varint_sync(&mut r)?;
+                let text = component_text(&read_nbt(&mut r)?);
+                println!("Java: {name} died on Horizon ({text}); respawning");
+                c.send(0x0c, &[0]).await?; // the message itself also comes as system chat
+            }
+            (State::Game, 0x68) => {
+                // set_equipment: entity id, then (slot byte, top bit = more follow; item)s.
+                let id = read_varint_sync(&mut r)?;
+                if !tracked.contains_key(&id) {
+                    continue; // only players are shown on Bedrock so far
+                }
+                let mut slots = Vec::new();
+                let read: io::Result<()> = (|| loop {
+                    let slot = take_bytes(&mut r, 1)?[0];
+                    slots.push((slot & 127, read_item(&mut r)?));
+                    if slot & 128 == 0 {
+                        return Ok(());
+                    }
+                })();
+                if let Err(e) = read {
+                    eprintln!("Java: equipment of entity {id} only partly read: {e}");
+                }
+                if events.send(Event::Equipment { id, slots }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x6b) => {
+                let slot = read_varint_sync(&mut r)?.clamp(0, 8) as u8; // set_held_slot
+                if events.send(Event::HeldSlot(slot)).is_err() {
+                    return Ok(());
+                }
+            }
             (State::Game, 0x08 | 0x56) => {
                 let blocks = if id == 0x08 {
                     // block_update: position, block state
@@ -909,6 +1092,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_items() {
+        assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
+        // 64 stone (id 1), no components.
+        assert_eq!(read_item(&mut &[64, 1, 0, 0][..]).unwrap(), Some(Item { id: 1, count: 64 }));
+        // A damaged tool: damage (3) = 5 added, max stack size (1) removed; then the next slot's byte is left.
+        let mut r = &[1, 0x8b, 0x07, 1, 1, 3, 5, 1, 9][..];
+        assert_eq!(read_item(&mut r).unwrap(), Some(Item { id: 907, count: 1 }));
+        assert_eq!(r, [9]);
+        assert!(read_item(&mut &[1, 1, 1, 0, 99, 0][..]).is_err(), "unknown component");
+        assert_eq!((menu_to_inventory(36), menu_to_inventory(5), menu_to_inventory(45), menu_to_inventory(0)), (Some(0), Some(39), Some(40), None));
+    }
+
+    #[test]
     fn reads_overworld_clock() {
         // Captured from Horizon on join: game time 73063, clocks 0 (109329 ticks) and 1 (73063), both at rate 1.
         let join = [
@@ -991,6 +1187,10 @@ mod tests {
                 Event::Rain(v) => println!("rain {v}"),
                 Event::Thunder(v) => println!("thunder {v}"),
                 Event::Time(t) => println!("time {t}"),
+                Event::Inventory { slots, all } => println!("inventory (all: {all}): {slots:?}"),
+                Event::HeldSlot(s) => println!("held slot {s}"),
+                Event::Health { health, food, saturation } => println!("health {health} food {food} saturation {saturation}"),
+                Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;

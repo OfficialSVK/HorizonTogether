@@ -18,21 +18,23 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Horizon's world on Bedrock | Horizon's chunks are translated to Bedrock sub-chunks (Java block states mapped through Geyser's table), and the player spawns at Horizon's position. Verified: a real Horizon world renders correctly. | `src/world.rs`, `data/java_blocks.bin` |
 | Movement and game mode | Bedrock movement moves the Java player (one position per tick, ground state from Bedrock's collision flag), new terrain loads as you walk, and Horizon's game mode is applied on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
 | Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
-| Other players | Java players appear on Bedrock (name tag, plain generated skin), move, and disappear when they leave. | `src/bedrock.rs`, `src/java.rs` |
-| Blocks | Breaking on Bedrock breaks on Horizon (verified in creative), and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
+| Other players | Java players appear on Bedrock (name tag, generated Steve-shaped skin), move, and disappear when they leave. What they hold and their armour are shown. | `src/bedrock.rs`, `src/java.rs` |
+| Blocks | Breaking and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
+| Items | The full item list and creative menu (byte-identical to Mojang's server). The Horizon inventory (hotbar, main, armour, offhand) shows on Bedrock, and the selected hotbar slot is synced both ways. | `data/item_registry.bin`, `data/creative_content.bin`, `data/java_items.bin` |
+| Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
+| Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 25 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 31 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
 These are shortcuts that are deliberate for now. The ones inside the code are marked `shortcut:` (search for that).
 
 - **Login identity is not verified.** Anyone who can reach the bridge can join under any name. Keep it on a LAN or VPN until [ROADMAP](ROADMAP.md) item 1 is done.
-- **Movement isn't linked yet.** Moving on Bedrock doesn't move the Java player, and new terrain doesn't load as you walk.
-- **Other players aren't shown** on Bedrock (no entities yet), and chat, block breaking and placing aren't forwarded.
-- **Every biome is plains** (grass and leaf colours are off), and block entities (chests, signs) have no data.
+- **No mobs or dropped items** on Bedrock yet, only players. Other players' real skins and animations (swing, sneak) aren't shown.
+- **Inventory is one-way.** Taking items from the creative menu, moving items between slots, dropping and attacking aren't sent to Horizon yet (Bedrock's item stack requests aren't answered). Items show no damage, names or enchantment glint.
+- **Every biome is plains** (grass and leaf colours are off), and block entities (chests, signs) have no data. No biome definitions are sent (the client uses its built-in ones).
 - Relative teleports from Horizon are treated as absolute.
-- **Empty inventory and creative menu.** ItemRegistry and CreativeContent are sent empty, and no biome definitions are sent (the client uses its built-in ones).
 - **One ephemeral UDP port per player.** This works on a LAN. Hosting behind port forwarding needs a fixed port range.
 - **Plain HTTP signaling**, so the client shows a "trust and join" prompt the first time. TLS would remove it.
 - **Joining over RakNet** (clients older than 26.60) is not implemented; only the server-list pong is.
