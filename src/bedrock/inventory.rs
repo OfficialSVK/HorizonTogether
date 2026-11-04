@@ -8,6 +8,7 @@ use crate::java::{Command, Item};
 const ARMOR: u8 = 6;
 const LEVEL_ENTITY: u8 = 7; // chests, dispensers, hoppers
 const COMBINED: u8 = 12;
+const CRAFTING_INPUT: u8 = 13; // slots 28-31: the inventory's 2x2 grid; 32-40: a crafting table's 3x3
 const FURNACE_FUEL: u8 = 24;
 const FURNACE_INGREDIENT: u8 = 25;
 const FURNACE_RESULT: u8 = 26;
@@ -50,6 +51,10 @@ pub(super) enum Action {
     Destroy { count: u8, src: SlotRef },
     /// Creative: the creative menu entry with this net id goes to the created-output slot.
     CraftCreative(u32),
+    /// The recipe with this network id is crafted `times` times: its result goes to the created-output slot.
+    CraftRecipe { id: u32, times: u8 },
+    /// A crafting grid slot's items are used up by the recipe.
+    Consume { count: u8, src: SlotRef },
     /// Crafting and the rest: not handled yet, so the request is refused.
     Unsupported(u32),
     /// Informational (the "craft results" list after a creative pick): nothing to do.
@@ -71,6 +76,8 @@ enum Place {
     Created,
     /// A slot of the open container, in Java menu order.
     Container(u8),
+    /// A crafting grid slot, row by row: the inventory's 2x2, or an open crafting table's 3x3.
+    Craft(u8),
 }
 
 impl Session {
@@ -78,7 +85,10 @@ impl Session {
         let open = self.open.as_ref();
         let size = open.map_or(0, |o| o.slots.len());
         let furnace = open.is_some_and(|o| o.furnace);
+        let table = open.is_some_and(|o| o.kind == 1);
         match (s.container, s.slot) {
+            (CRAFTING_INPUT, 28..=31) if open.is_none() => Some(Place::Craft(s.slot - 28)),
+            (CRAFTING_INPUT, 32..=40) if table => Some(Place::Craft(s.slot - 32)),
             (HOTBAR | INVENTORY | COMBINED, 0..=35) => Some(Place::Inv(s.slot)),
             (ARMOR, 0..=3) => Some(Place::Inv(39 - s.slot)), // Bedrock head..feet, Java feet (36)..head (39)
             (OFFHAND, _) => Some(Place::Inv(40)),
@@ -96,15 +106,21 @@ impl Session {
     /// The Java menu slot of a place, in the open container's window or else the player's inventory menu;
     /// None for what that window has no slot for (armor and offhand inside a container window).
     fn menu_slot(&self, p: Place) -> Option<i16> {
+        // A crafting grid is menu slots 1 on (after the result, 0) in the inventory menu and a crafting table's.
         let Some(open) = &self.open else {
             return match p {
                 Place::Inv(i) => Some(crate::java::inventory_to_menu(i)),
+                Place::Craft(i) => Some(1 + i as i16),
+                Place::Created => Some(0),
                 _ => Some(-999),
             };
         };
         let size = open.slots.len() as i16;
         match p {
             Place::Container(s) => Some(s as i16),
+            Place::Craft(i) if open.kind == 1 => Some(1 + i as i16),
+            Place::Created if open.kind == 1 => Some(0),
+            Place::Craft(_) => None,
             Place::Inv(i @ 0..=8) => Some(size + 27 + i as i16),
             Place::Inv(i @ 9..=35) => Some(size + i as i16 - 9),
             Place::Inv(_) => None,
@@ -177,11 +193,7 @@ fn read_action(r: &mut &[u8]) -> Result<Action, String> {
             a
         }
         4 => Action::Destroy { count: count(r)?, src: read_slot(r)? },
-        5 => {
-            count(r)?;
-            read_slot(r)?;
-            Action::Unsupported(kind) // consume (crafting)
-        }
+        5 => Action::Consume { count: count(r)?, src: read_slot(r)? },
         6 => {
             take(r, 1)?;
             Action::Unsupported(kind) // create (crafting)
@@ -196,8 +208,8 @@ fn read_action(r: &mut &[u8]) -> Result<Action, String> {
         }
         12 | 14 => {
             let id = read_uvarint(r)?;
-            take(r, 1)?; // times
-            if kind == 14 { Action::CraftCreative(id) } else { Action::Unsupported(kind) }
+            let times = take(r, 1)?[0];
+            if kind == 14 { Action::CraftCreative(id) } else { Action::CraftRecipe { id, times } }
         }
         20 => {
             // Craft results (deprecated, still sent after CraftCreative): result items, then times crafted.
@@ -235,6 +247,17 @@ impl Session {
             let container_before = self.open.as_ref().map(|o| o.slots.clone());
             match self.apply(&req.actions) {
                 Ok((touched, commands)) => {
+                    if std::env::var_os("HORIZON_DEBUG_INVENTORY").is_some() {
+                        let clicks: Vec<String> = commands
+                            .iter()
+                            .map(|c| match c {
+                                Command::Click { window, slot, button, mode } => format!("click w{window} s{slot} b{button} m{mode}"),
+                                Command::CreativeSlot { slot, item } => format!("creative s{slot} {item:?}"),
+                                _ => "other".into(),
+                            })
+                            .collect();
+                        println!("DEBUG request {:?} -> {clicks:?}", req.actions);
+                    }
                     self.to_java.extend(commands);
                     w.u8(0).varint(req.id);
                     self.write_containers(&mut w, &touched);
@@ -258,6 +281,10 @@ impl Session {
             Place::Cursor => self.cursor,
             Place::Created => self.created,
             Place::Container(s) => self.open.as_ref().and_then(|o| o.slots.get(s as usize).copied().flatten()),
+            Place::Craft(i) => match &self.open {
+                Some(o) => o.slots.get(1 + i as usize).copied().flatten(),
+                None => self.craft.get(i as usize).copied().flatten(),
+            },
         }
     }
 
@@ -272,13 +299,30 @@ impl Session {
                     *slot = item;
                 }
             }
+            Place::Craft(i) => {
+                let slot = match self.open.as_mut() {
+                    Some(o) => o.slots.get_mut(1 + i as usize),
+                    None => self.craft.get_mut(i as usize),
+                };
+                if let Some(slot) = slot {
+                    *slot = item;
+                }
+            }
         }
     }
 
     /// Applies the actions to the model; returns the slots to report and the commands for Horizon.
     fn apply(&mut self, actions: &[Action]) -> Result<(Vec<SlotRef>, Vec<Command>), String> {
-        // Creative edits only reach the player's own inventory; with a container open, moves are clicks.
-        let creative = self.game_mode == 1 && self.open.is_none();
+        // Creative edits only reach the player's own inventory; with a container open, or crafting (Horizon
+        // makes the result from its grid), moves are clicks.
+        let crafting = actions.iter().any(|a| match a {
+            Action::CraftRecipe { .. } | Action::Consume { .. } => true,
+            Action::Move { src, dst, .. } => src.container == CRAFTING_INPUT || dst.container == CRAFTING_INPUT,
+            Action::Swap(a, b) => a.container == CRAFTING_INPUT || b.container == CRAFTING_INPUT,
+            _ => false,
+        });
+        let creative = self.game_mode == 1 && self.open.is_none() && !crafting;
+        let mut result_shifted = false; // "craft all" places the result in several slots: one Java shift-click
         let before = self.inventory;
         let mut touched = Vec::new();
         let mut java = Vec::new();
@@ -303,6 +347,18 @@ impl Session {
                         // A Java player: whole stacks with a left click, single items with right clicks.
                         let cursor_free = self.cursor.is_none();
                         match (from, to) {
+                            // A crafting result: taken from Java's result slot, one left click per craft to the
+                            // cursor, or a shift-click (Java crafts as many as the grid allows) into the inventory.
+                            (Place::Created, Place::Cursor) if self.crafted => {
+                                let per_craft = crate::world::recipe_output(self.recipe).map_or(1, |(_, n)| n.max(1));
+                                click(&mut java, menu(from)?, 0, 0, (count / per_craft).max(1) as u32);
+                            }
+                            (Place::Created, _) if self.crafted => {
+                                if !result_shifted {
+                                    click(&mut java, menu(from)?, 0, 1, 1);
+                                    result_shifted = true;
+                                }
+                            }
                             (Place::Created, _) => return Err("creative menu outside creative".into()),
                             (Place::Cursor, _) if count == s.count => click(&mut java, menu(to)?,0, 0, 1),
                             (Place::Cursor, _) => click(&mut java, menu(to)?,1, 0, count as u32),
@@ -367,6 +423,19 @@ impl Session {
                 Action::CraftCreative(id) if creative => {
                     let java_id = crate::world::creative_java(id).ok_or(format!("creative item {id} unknown"))?;
                     self.created = Some(Item { id: java_id, count: 255 });
+                    self.crafted = false;
+                }
+                Action::CraftRecipe { id, times } => {
+                    let (java_id, count) = crate::world::recipe_output(id).ok_or(format!("recipe {id} unknown"))?;
+                    self.created = Some(Item { id: java_id, count: count.saturating_mul(times.max(1)) });
+                    (self.crafted, self.recipe) = (true, id);
+                }
+                // The grid's items: Horizon uses them up itself when the result is taken.
+                Action::Consume { count, src } => {
+                    let p = at(src)?;
+                    let s = self.get(p).filter(|s| s.count >= count).ok_or("nothing to consume")?;
+                    self.set(p, Some(Item { count: s.count - count, ..s }));
+                    touched.push(src);
                 }
                 ref other => return Err(format!("{other:?} not handled (game mode {})", self.game_mode)),
             }
@@ -489,6 +558,33 @@ mod tests {
         // Taking half is one right click.
         let (_, java) = s.apply(&[Action::Move { count: 3, src: hotbar0, dst: cursor }]).unwrap();
         assert!(matches!(java[..], [Command::Click { window: 0, slot: 36, button: 1, mode: 0 }]));
+    }
+
+    #[test]
+    fn crafting_in_the_inventory_grid() {
+        let mut s = Session { game_mode: 1, ..Default::default() }; // crafting is clicks even in creative
+        let planks = crate::world::creative_java(1).unwrap(); // oak planks
+        let recipe = (1..4000).find(|&n| crate::world::recipe_output(n).is_some_and(|(id, c)| id == planks && c == 4)).unwrap();
+        s.inventory[0] = Some(Item { id: 9999, count: 1 }); // a log (any id: Horizon checks the recipe, not the bridge)
+        let (hotbar0, cursor) = (SlotRef { container: HOTBAR, slot: 0 }, SlotRef { container: CURSOR, slot: 0 });
+        let grid0 = SlotRef { container: CRAFTING_INPUT, slot: 28 };
+        let output = SlotRef { container: CREATED, slot: 50 };
+        // Put the log in the grid's first slot: pick it up (Java slot 36), put it in grid slot 1.
+        let (_, java) = s.apply(&[Action::Move { count: 1, src: hotbar0, dst: grid0 }]).unwrap();
+        let clicks = |java: &[Command]| -> Vec<(i16, i8, i32)> {
+            java.iter().map(|c| match c { Command::Click { window: 0, slot, button, mode } => (*slot, *button, *mode), _ => panic!("not a click") }).collect()
+        };
+        assert_eq!(clicks(&java), [(36, 0, 0), (1, 0, 0)]);
+        // Craft once and take the 4 planks to the cursor: one left click on the result slot (0).
+        let craft = [
+            Action::CraftRecipe { id: recipe, times: 1 },
+            Action::Consume { count: 1, src: grid0 },
+            Action::Move { count: 4, src: output, dst: cursor },
+        ];
+        let (touched, java) = s.apply(&craft).unwrap();
+        assert_eq!(clicks(&java), [(0, 0, 0)]);
+        assert_eq!((s.craft[0], s.cursor), (None, Some(Item { id: planks, count: 4 })));
+        assert_eq!(touched, [grid0, cursor]);
     }
 
     #[test]

@@ -96,6 +96,17 @@ pub fn bedrock_entity(kind: i32) -> Option<&'static str> {
     JAVA_ENTITIES.lines().nth(usize::try_from(kind).ok()?).filter(|s| !s.is_empty())
 }
 
+/// Per recipe network id (from 1): the output's Java item id (i32 LE, -1 none) and count (u8) (tools/gen_recipes.py).
+static RECIPE_JAVA: &[u8] = include_bytes!("../data/recipe_java.bin");
+
+/// The Java item and count a Bedrock crafting recipe makes.
+pub fn recipe_output(net_id: u32) -> Option<(i32, u8)> {
+    let i = (net_id as usize).checked_sub(1)? * 5;
+    let e = RECIPE_JAVA.get(i..i + 5)?;
+    let id = i32::from_le_bytes(e[..4].try_into().unwrap());
+    (id >= 0).then_some((id, e[4]))
+}
+
 /// Java chest and trapped chest states: `state dx dz lead` per line (tools/gen_block_table.py).
 static JAVA_CHESTS: &str = include_str!("../data/java_chests.txt");
 

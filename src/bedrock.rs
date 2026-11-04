@@ -136,9 +136,15 @@ pub struct Session {
     shown: std::collections::HashMap<i32, Shown>,
     /// The container window open on Bedrock (a Horizon menu), if any.
     open: Option<inventory::Open>,
-    /// The inventory screen's cursor, and the creative menu's output slot (the item just picked from it).
+    /// The inventory screen's cursor, and the creative menu's or crafting grid's output slot.
     cursor: Option<crate::java::Item>,
     created: Option<crate::java::Item>,
+    /// The output slot holds a crafting result (taken with a Java click) rather than a creative pick, and its
+    /// recipe's network id.
+    crafted: bool,
+    recipe: u32,
+    /// The inventory's 2x2 crafting grid (a crafting table's grid is in `open`).
+    craft: [Option<crate::java::Item>; 4],
 }
 
 impl Default for Session {
@@ -170,6 +176,9 @@ impl Default for Session {
             shown: Default::default(),
             cursor: None,
             created: None,
+            crafted: false,
+            recipe: 0,
+            craft: [None; 4],
         }
     }
 }
@@ -305,7 +314,9 @@ impl Session {
                             packet_bytes(AVAILABLE_ACTOR_IDENTIFIERS, include_bytes!("../data/entity_identifiers.dat")),
                             // PocketMine sends both before spawn: no commands, no recipes (8 and 11 empty lists).
                             packet_bytes(AVAILABLE_COMMANDS, &[0; 8]),
-                            packet_bytes(CRAFTING_DATA, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), // ..., clear recipes
+                            // Bedrock's crafting-table recipes (tools/gen_recipes.py): the client only shows a
+                            // crafting result it has a recipe for; Horizon does the crafting.
+                            packet_bytes(CRAFTING_DATA, include_bytes!("../data/crafting_data.bin")),
                         ]));
                     }
                     s => println!("Bedrock: client refused resource packs (status {s})"),
@@ -429,6 +440,7 @@ impl Session {
                     // Closing a screen puts the cursor's items back in the inventory (Bedrock does it itself;
                     // Horizon, on the close below, then sends the slots).
                     self.cursor = None;
+                    self.craft = [None; 4]; // and the inventory's crafting grid's
                     if self.linked && window == 0 {
                         self.to_java.push(crate::java::Command::CloseInventory); // the cursor's items go back
                     } else if let Some(open) = self.open.take_if(|o| o.window == window) {
@@ -651,6 +663,7 @@ impl Session {
             crate::java::Event::OpenContainer { window, menu, size } if self.spawned => {
                 // Bedrock window types: chest-like 0, dispenser 6, hopper 8, furnace 2, blast furnace 27, smoker 28.
                 let kind = match menu {
+                    12 => 1, // crafting table (workbench)
                     6 => 6,
                     16 => 8,
                     14 => 2,
@@ -669,6 +682,9 @@ impl Session {
             crate::java::Event::ContainerContent { window, slots } => {
                 let Some(open) = self.open.as_mut().filter(|o| o.java_window == window) else { return Vec::new() };
                 open.slots = slots;
+                if open.kind == 1 {
+                    return Vec::new(); // a crafting table's grid is Bedrock's own (its requests), not window slots
+                }
                 let (bedrock_window, slots) = (open.window, open.slots.clone());
                 let mut w = W::default();
                 w.varuint(bedrock_window as u32).varuint(slots.len() as u32);
@@ -685,6 +701,9 @@ impl Session {
                     return Vec::new(); // Bedrock already shows it (its own move, echoed)
                 }
                 open.slots[slot] = item;
+                if open.kind == 1 {
+                    return Vec::new(); // crafting table: see ContainerContent
+                }
                 let bedrock_window = open.window;
                 let mut w = W::default();
                 w.varuint(bedrock_window as u32).varuint(slot as u32).bool(false).bool(false);

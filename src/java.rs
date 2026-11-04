@@ -229,6 +229,7 @@ pub fn menu_size(menu: i32) -> Option<usize> {
         16 => Some(5),
         20 => Some(27),
         10 | 14 | 22 => Some(3), // blast furnace, furnace, smoker: ingredient, fuel, result
+        12 => Some(10),          // crafting table: result, then the 3x3 grid
         _ => None,
     }
 }
