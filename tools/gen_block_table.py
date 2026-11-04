@@ -9,7 +9,7 @@ Inputs:
 Usage: python -I tools/gen_block_table.py <blocks.nbt> <blocks.json> <out.bin>
 The hash must match src/world.rs block_hash: FNV-1a 32 over little-endian NBT {name, states (keys sorted)}.
 """
-import gzip, json, struct, sys
+import gzip, json, os, struct, sys
 
 
 def read_nbt(b):
@@ -75,11 +75,33 @@ def block_hash(name, states):
     return h
 
 
+def chest_states(blocks):
+    """Java chest and trapped chest states as `state dx dz lead` lines: the paired half's offset (0 0 for a
+    single chest) and whether this half leads on Bedrock (the right one, as Geyser's
+    DoubleChestBlockEntityTranslator does)."""
+    lines = []
+    for name in ("minecraft:chest", "minecraft:trapped_chest"):
+        for state in blocks[name]["states"]:
+            p = state["properties"]
+            dx = dz = 0
+            if p["type"] != "single":
+                left = p["type"] == "left"
+                dx, dz = {"east": (0, 1 if left else -1), "west": (0, -1 if left else 1),
+                          "south": (-1 if left else 1, 0), "north": (1 if left else -1, 0)}[p["facing"]]
+            lead = int(p["type"] == "right")
+            lines.append(f"{state['id']} {dx} {dz} {lead}")
+    return "\n".join(lines) + "\n"
+
+
 def main(nbt_path, json_path, out_path):
     _, root = read_nbt(gzip.open(nbt_path).read())
     mappings = [v for _, v in root["bedrock_mappings"][1]]
     java_names = {}
-    for name, block in json.load(open(json_path, encoding="utf-8")).items():
+    blocks = json.load(open(json_path, encoding="utf-8"))
+    chests = os.path.join(os.path.dirname(out_path), "java_chests.txt")
+    open(chests, "w", newline="\n").write(chest_states(blocks))
+    print(f"chest states -> {chests}")
+    for name, block in blocks.items():
         for state in block["states"]:
             java_names[state["id"]] = name
     if len(java_names) != len(mappings):

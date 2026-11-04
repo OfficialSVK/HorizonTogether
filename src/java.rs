@@ -207,15 +207,40 @@ pub enum Command {
     HeldSlot(u8),
     /// Creative-mode inventory edit (set_creative_mode_slot): a player menu slot, or -1 to drop the item.
     CreativeSlot { slot: i16, item: Option<Item> },
-    /// A click in the player's inventory menu (container_click, window 0): slot (-999 = outside the window),
-    /// button, mode (0 pickup, 4 throw).
-    Click { slot: i16, button: i8, mode: i32 },
+    /// A click in a menu (container_click): window (0 = the player's inventory), slot (-999 = outside the
+    /// window), button, mode (0 pickup, 4 throw).
+    Click { window: i32, slot: i16, button: i8, mode: i32 },
     /// Attack an entity, with the arm swing a Java client sends with every attack.
     Attack(i32),
     /// Use (right-click) an entity with the main hand.
     Interact(i32),
     /// The inventory screen closed (container_close, window 0): the server puts the cursor's items back.
     CloseInventory,
+    /// The player closed an open container window.
+    CloseContainer(i32),
+}
+
+/// Container slots of the Java menus the bridge shows (menu registry ids, 26.3): chests and barrels (generic
+/// 9xN), dispensers and droppers (3x3), hoppers, shulker boxes and the furnaces.
+pub fn menu_size(menu: i32) -> Option<usize> {
+    match menu {
+        0..=5 => Some(9 * (menu as usize + 1)),
+        6 => Some(9),
+        16 => Some(5),
+        20 => Some(27),
+        10 | 14 | 22 => Some(3), // blast furnace, furnace, smoker: ingredient, fuel, result
+        _ => None,
+    }
+}
+
+/// A slot of an open container's Java menu that lies in the player's inventory (after the container's own
+/// `size` slots: 27 main, then 9 hotbar), as a Java Inventory index.
+fn container_menu_to_inventory(slot: usize, size: usize) -> Option<u8> {
+    match slot.checked_sub(size)? {
+        i @ 0..=26 => Some(9 + i as u8),
+        i @ 27..=35 => Some((i - 27) as u8),
+        _ => None,
+    }
 }
 
 /// player_action actions in 26.3 (one more than older versions: 1 is "change destroy direction").
@@ -287,8 +312,15 @@ pub enum Event {
     HeldSlot(u8),
     /// Health (0-20), food level (0-20) and saturation.
     Health { health: f32, food: i32, saturation: f32 },
-    /// The item on the inventory screen's cursor.
-    Cursor(Option<Item>),
+    /// The server opened a container (open_screen): window id, menu type, container slots.
+    OpenContainer { window: i32, menu: i32, size: usize },
+    /// The open container's slots: all of them, or one.
+    ContainerContent { window: i32, slots: Vec<Option<Item>> },
+    ContainerSlot { window: i32, slot: usize, item: Option<Item> },
+    /// A container property (furnace fuel and progress): Java property id and value.
+    ContainerData { window: i32, key: i16, value: i16 },
+    /// The server closed the container window.
+    CloseContainer(i32),
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
     Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
@@ -777,6 +809,9 @@ pub async fn play(
     let mut sequence = 0i32;
     // State id of the player's inventory menu, from the server's last container_set_content/slot.
     let mut menu_state = 0i32;
+    // The open container window shown on Bedrock (window id, container slots) and its state id.
+    let mut open: Option<(i32, usize)> = None;
+    let mut open_state = 0i32;
     loop {
         let (id, body) = tokio::select! {
             packet = packets.recv() => packet.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))??,
@@ -837,11 +872,11 @@ pub async fn play(
                         write_item(&mut m, item);
                         c.send(0x39, &m).await?; // set_creative_mode_slot
                     }
-                    Command::Click { slot, button, mode } => {
+                    Command::Click { window, slot, button, mode } => {
                         // No predicted slots or cursor: the server applies the click and sends back what changed.
                         let mut m = Vec::new();
-                        write_varint(&mut m, 0); // window: the player's inventory
-                        write_varint(&mut m, menu_state);
+                        write_varint(&mut m, window);
+                        write_varint(&mut m, if window == 0 { menu_state } else { open_state });
                         m.extend(slot.to_be_bytes());
                         m.push(button as u8);
                         write_varint(&mut m, mode);
@@ -861,6 +896,14 @@ pub async fn play(
                         c.send(0x1a, &m).await?; // interact
                     }
                     Command::CloseInventory => c.send(0x13, &[0]).await?, // container_close, window 0
+                    Command::CloseContainer(window) => {
+                        if open.is_some_and(|(w, _)| w == window) {
+                            open = None;
+                        }
+                        let mut m = Vec::new();
+                        write_varint(&mut m, window);
+                        c.send(0x13, &m).await?; // container_close
+                    }
                 }
                 continue;
             }
@@ -1042,7 +1085,11 @@ pub async fn play(
             (State::Game, 0x12 | 0x14 | 0x6e) => {
                 // container_set_content / container_set_slot (window 0 = the player's inventory menu: window id,
                 // state id, then all slots or one i16 slot), set_player_inventory (Inventory index, item).
+                // In an open container's window, the container's own slots come first, then the player's
+                // inventory (27 main, 9 hotbar).
                 let mut slots = Vec::new();
+                let mut container: Vec<(usize, Option<Item>)> = Vec::new();
+                let mut window = 0;
                 let all = id == 0x12;
                 let result: io::Result<()> = (|| {
                     if id == 0x6e {
@@ -1051,26 +1098,93 @@ pub async fn play(
                         slots.extend(u8::try_from(slot).ok().filter(|s| *s <= 40).map(|s| (s, item)));
                         return Ok(());
                     }
-                    if read_varint_sync(&mut r)? != 0 {
-                        return Ok(()); // another container (chests come later)
+                    window = read_varint_sync(&mut r)?;
+                    let size = match open {
+                        _ if window == 0 => 0,
+                        Some((w, size)) if w == window => size,
+                        _ => return Ok(()), // a window we don't show
+                    };
+                    let state = read_varint_sync(&mut r)?;
+                    if window == 0 {
+                        menu_state = state;
+                    } else {
+                        open_state = state;
                     }
-                    menu_state = read_varint_sync(&mut r)?;
+                    let mut put = |slot: usize, item| {
+                        if window == 0 {
+                            slots.extend(menu_to_inventory(slot as i32).map(|s| (s, item)));
+                        } else if slot < size {
+                            container.push((slot, item));
+                        } else {
+                            slots.extend(container_menu_to_inventory(slot, size).map(|s| (s, item)));
+                        }
+                    };
                     if all {
                         for slot in 0..read_varint_sync(&mut r)? {
                             let item = read_item(&mut r)?;
-                            slots.extend(menu_to_inventory(slot).map(|s| (s, item)));
+                            put(slot as usize, item);
                         }
                     } else {
                         let slot = i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap());
                         let item = read_item(&mut r)?;
-                        slots.extend(menu_to_inventory(slot as i32).map(|s| (s, item)));
+                        if slot >= 0 {
+                            put(slot as usize, item);
+                        }
                     }
                     Ok(())
                 })();
                 if let Err(e) = &result {
                     eprintln!("Java: inventory packet {id:#x} only partly read: {e}");
                 }
+                let container_event = match (all, &container[..]) {
+                    (_, []) => None,
+                    (true, _) => Some(Event::ContainerContent { window, slots: container.iter().map(|&(_, i)| i).collect() }),
+                    (false, &[(slot, item)]) => Some(Event::ContainerSlot { window, slot, item }),
+                    _ => None,
+                };
+                if let Some(e) = container_event
+                    && events.send(e).is_err()
+                {
+                    return Ok(());
+                }
                 if !slots.is_empty() && events.send(Event::Inventory { slots }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x3c) => {
+                // open_screen: window id, menu type, title. Menus Bedrock can't show yet are closed at once.
+                let window = read_varint_sync(&mut r)?;
+                let menu = read_varint_sync(&mut r)?;
+                match menu_size(menu) {
+                    Some(size) => {
+                        open = Some((window, size));
+                        if events.send(Event::OpenContainer { window, menu, size }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    None => {
+                        println!("Java: {name} opened menu type {menu}, which Bedrock can't show yet; closing it");
+                        let mut m = Vec::new();
+                        write_varint(&mut m, window);
+                        c.send(0x13, &m).await?;
+                    }
+                }
+            }
+            (State::Game, 0x11 | 0x13) => {
+                // container_close (window) / container_set_data (window, property, value).
+                let window = read_varint_sync(&mut r)?;
+                if !open.is_some_and(|(w, _)| w == window) {
+                    continue;
+                }
+                let event = if id == 0x11 {
+                    open = None;
+                    Event::CloseContainer(window)
+                } else {
+                    let key = i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap());
+                    let value = i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap());
+                    Event::ContainerData { window, key, value }
+                };
+                if events.send(event).is_err() {
                     return Ok(());
                 }
             }
@@ -1160,13 +1274,8 @@ pub async fn play(
                     return Ok(());
                 }
             }
-            (State::Game, 0x62) => {
-                // set_cursor_item: what the player holds on the cursor in an inventory screen.
-                let item = read_item(&mut r)?;
-                if events.send(Event::Cursor(item)).is_err() {
-                    return Ok(());
-                }
-            }
+            // set_cursor_item (0x62) is ignored: Horizon reports the cursor after each of the bridge's clicks
+            // (holding the stack mid-move) but not the empty one at the end, and Bedrock knows its own cursor.
             (State::Game, 0x6b) => {
                 let slot = read_varint_sync(&mut r)?.clamp(0, 8) as u8; // set_held_slot
                 if events.send(Event::HeldSlot(slot)).is_err() {
@@ -1310,6 +1419,38 @@ mod tests {
         session.abort();
     }
 
+    /// Live check: right-click the block east of the feet (the console puts a chest there) and print what opens.
+    #[tokio::test]
+    #[ignore]
+    async fn opens_a_chest() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let mut at = None;
+        while at.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            at = rx.try_iter().find_map(|e| if let Event::Position { x, y, z, .. } = e { Some([x, y, z]) } else { None });
+        }
+        let [x, y, z] = at.unwrap();
+        let block = [x.floor() as i32 + 1, y.floor() as i32, z.floor() as i32];
+        for tick in 0..120 {
+            let _ = cmd_tx.send(Command::Move { x, y, z, yaw: -90.0, pitch: 0.0, on_ground: true });
+            if tick == 80 {
+                let _ = cmd_tx.send(Command::UseOn { pos: block, face: 4, cursor: [0.0, 0.5, 0.5] });
+            }
+            let _ = cmd_tx.send(Command::TickEnd);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for e in rx.try_iter() {
+                match e {
+                    Event::OpenContainer { window, menu, size } => println!("opened window {window}: menu {menu}, {size} slots"),
+                    Event::ContainerContent { window, slots } => println!("window {window} content: {slots:?}"),
+                    _ => {}
+                }
+            }
+        }
+        session.abort();
+    }
+
     #[test]
     fn reads_items() {
         assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
@@ -1412,12 +1553,13 @@ mod tests {
                 Event::HeldSlot(s) => println!("held slot {s}"),
                 Event::Health { health, food, saturation } => println!("health {health} food {food} saturation {saturation}"),
                 Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
-                Event::Cursor(item) => println!("cursor {item:?}"),
+                Event::OpenContainer { window, menu, size } => println!("container {window}: menu {menu}, {size} slots"),
+                Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
                 Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } => {}
                 Event::Chunk { data, .. } => {
-                    crate::world::java_chunk_to_bedrock(&data).expect("translates");
+                    crate::world::java_chunk_to_bedrock(&data, 0, 0).expect("translates");
                     chunks += 1;
                 }
                 Event::Position { x, y, z, .. } => pos = Some((x, y, z)),

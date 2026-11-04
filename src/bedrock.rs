@@ -56,13 +56,14 @@ const MOB_ARMOR_EQUIPMENT: u32 = 32;
 const PLAYER_HOTBAR: u32 = 48;
 const INVENTORY_CONTENT: u32 = 49;
 const INVENTORY_SLOT: u32 = 50;
-/// Bedrock container ids of the player's armor and offhand (the inventory is 0), and the UI (cursor) container.
+/// Bedrock container ids of the player's armor and offhand (the inventory is 0).
 const ARMOR: u32 = 120;
 const OFFHAND: u32 = 119;
-const UI_CONTAINER: u32 = 124;
 const INTERACT: u32 = 33;
 const CONTAINER_OPEN: u32 = 46;
 const CONTAINER_CLOSE: u32 = 47;
+const CONTAINER_SET_DATA: u32 = 51;
+const BLOCK_ACTOR_DATA: u32 = 56;
 const ITEM_STACK_REQUEST: u32 = 147;
 const ITEM_STACK_RESPONSE: u32 = 148;
 const SET_TIME: u32 = 10;
@@ -133,6 +134,8 @@ pub struct Session {
     debug_flags: u128,
     /// Java entities shown on Bedrock, and as what.
     shown: std::collections::HashMap<i32, Shown>,
+    /// The container window open on Bedrock (a Horizon menu), if any.
+    open: Option<inventory::Open>,
     /// The inventory screen's cursor, and the creative menu's output slot (the item just picked from it).
     cursor: Option<crate::java::Item>,
     created: Option<crate::java::Item>,
@@ -163,6 +166,7 @@ impl Default for Session {
             last_click: None,
             equipment: Default::default(),
             debug_flags: 0,
+            open: None,
             shown: Default::default(),
             cursor: None,
             created: None,
@@ -422,8 +426,13 @@ impl Session {
                 CONTAINER_CLOSE => {
                     let (window, kind) = (*packet.first().unwrap_or(&0), *packet.get(1).unwrap_or(&0));
                     out.push(self.batch(&[packet_bytes(CONTAINER_CLOSE, &[window, kind, 0])]));
+                    // Closing a screen puts the cursor's items back in the inventory (Bedrock does it itself;
+                    // Horizon, on the close below, then sends the slots).
+                    self.cursor = None;
                     if self.linked && window == 0 {
                         self.to_java.push(crate::java::Command::CloseInventory); // the cursor's items go back
+                    } else if let Some(open) = self.open.take_if(|o| o.window == window) {
+                        self.to_java.push(crate::java::Command::CloseContainer(open.java_window));
                     }
                 }
                 ITEM_STACK_REQUEST if self.linked && self.spawn_status_sent => {
@@ -639,18 +648,69 @@ impl Session {
                     }
                 }
             }
-            crate::java::Event::Cursor(item) => {
-                if self.cursor != item {
-                    self.cursor = item;
-                    if self.spawned {
-                        let mut w = W::default();
-                        w.varuint(UI_CONTAINER).varuint(0).bool(false).bool(false); // the cursor is UI slot 0
-                        self.net_id += 1;
-                        write_stack(&mut w, item, Some(self.net_id));
-                        packets.push(packet_bytes(INVENTORY_SLOT, &w.0));
-                    }
-                }
+            crate::java::Event::OpenContainer { window, menu, size } if self.spawned => {
+                // Bedrock window types: chest-like 0, dispenser 6, hopper 8, furnace 2, blast furnace 27, smoker 28.
+                let kind = match menu {
+                    6 => 6,
+                    16 => 8,
+                    14 => 2,
+                    10 => 27,
+                    22 => 28,
+                    _ => 0,
+                };
+                // The menu's block: the one the player just clicked. shortcut: containers opened otherwise
+                // (minecart chests, commands) show at the player's feet.
+                let at = self.last_click.map_or(self.pos.map(|v| v.floor() as i32), |(p, _, _)| p);
+                self.open = Some(inventory::Open { window: window as u8, java_window: window, kind, slots: vec![None; size], furnace: matches!(menu, 10 | 14 | 22) });
+                let mut w = W::default();
+                w.u8(window as u8).u8(kind).varint(at[0]).varint(at[1]).varint(at[2]).varint64(-1);
+                packets.push(packet_bytes(CONTAINER_OPEN, &w.0));
             }
+            crate::java::Event::ContainerContent { window, slots } => {
+                let Some(open) = self.open.as_mut().filter(|o| o.java_window == window) else { return Vec::new() };
+                open.slots = slots;
+                let (bedrock_window, slots) = (open.window, open.slots.clone());
+                let mut w = W::default();
+                w.varuint(bedrock_window as u32).varuint(slots.len() as u32);
+                for item in slots {
+                    self.net_id += 1;
+                    write_stack(&mut w, item, Some(self.net_id));
+                }
+                w.u8(0).bool(false).bytes(&[0; 8]); // container name, no dynamic id, no storage item
+                packets.push(packet_bytes(INVENTORY_CONTENT, &w.0));
+            }
+            crate::java::Event::ContainerSlot { window, slot, item } => {
+                let Some(open) = self.open.as_mut().filter(|o| o.java_window == window) else { return Vec::new() };
+                if open.slots.get(slot).is_none_or(|s| *s == item) {
+                    return Vec::new(); // Bedrock already shows it (its own move, echoed)
+                }
+                open.slots[slot] = item;
+                let bedrock_window = open.window;
+                let mut w = W::default();
+                w.varuint(bedrock_window as u32).varuint(slot as u32).bool(false).bool(false);
+                self.net_id += 1;
+                write_stack(&mut w, item, Some(self.net_id));
+                packets.push(packet_bytes(INVENTORY_SLOT, &w.0));
+            }
+            crate::java::Event::ContainerData { window, key, value } => {
+                let Some(open) = self.open.as_ref().filter(|o| o.java_window == window && o.furnace) else { return Vec::new() };
+                // Java furnace properties: 0 fuel left, 1 fuel total, 2 cook progress, 3 cook total; Bedrock's
+                // keys (Geyser's furnace translator): 0 cook progress, 1 fuel left, 2 fuel total.
+                let key = match key {
+                    0 => 1,
+                    1 => 2,
+                    2 => 0,
+                    _ => return Vec::new(),
+                };
+                let mut w = W::default();
+                w.u8(open.window).varint(key).varint(value as i32);
+                packets.push(packet_bytes(CONTAINER_SET_DATA, &w.0));
+            }
+            crate::java::Event::CloseContainer(window) => {
+                let Some(open) = self.open.take().filter(|o| o.java_window == window) else { return Vec::new() };
+                packets.push(packet_bytes(CONTAINER_CLOSE, &[open.window, open.kind, 1])); // closed by the server
+            }
+            crate::java::Event::OpenContainer { .. } => {}
             // shortcut: no Bedrock death screen; the bridge respawns the player on Horizon at once (java.rs), so the
             // health shown never reaches 0.
             crate::java::Event::Health { health, food, saturation } => {
@@ -707,10 +767,16 @@ impl Session {
                 let mut w = W::default();
                 w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
                 w.varuint(3).varuint(0); // flags: neighbours + network; layer 0
-                let p = packet_bytes(UPDATE_BLOCK, &w.0);
-                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+                let mut p = vec![packet_bytes(UPDATE_BLOCK, &w.0)];
+                // A chest's pairing (a second chest placed beside it changes both): its block entity data.
+                if let Some(nbt) = crate::world::chest_nbt(pos, state) {
+                    let mut e = W::default();
+                    e.varint(pos[0]).varint(pos[1]).varint(pos[2]).bytes(&nbt);
+                    p.push(packet_bytes(BLOCK_ACTOR_DATA, &e.0));
+                }
+                if self.spawned { packets.extend(p) } else { self.pending.extend(p) }
             }
-            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data) {
+            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data, x, z) {
                 Ok((count, payload)) => {
                     let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
                     if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -1556,7 +1622,9 @@ mod tests {
         let open = s.on_message(&[4, INTERACT as u8, 6, 1, 0]).unwrap();
         // One batch: ContainerOpen, window 0, type -1, block (1, 70, -3) zigzag, unique id 1 (zigzag 2).
         assert_eq!(open, [vec![8, CONTAINER_OPEN as u8, 0, 0xFF, 2, 140, 1, 5, 2]]);
+        s.cursor = Some(crate::java::Item { id: 1, count: 3 }); // left on the cursor when the screen closes
         let close = s.on_message(&[4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]).unwrap();
+        assert_eq!(s.cursor, None, "Bedrock puts the cursor's items back");
         assert_eq!(close, [vec![4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]]);
         assert!(matches!(s.take_to_java()[..], [crate::java::Command::CloseInventory]));
     }

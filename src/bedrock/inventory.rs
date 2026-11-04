@@ -6,12 +6,32 @@ use super::*;
 use crate::java::{Command, Item};
 
 const ARMOR: u8 = 6;
+const LEVEL_ENTITY: u8 = 7; // chests, dispensers, hoppers
 const COMBINED: u8 = 12;
+const FURNACE_FUEL: u8 = 24;
+const FURNACE_INGREDIENT: u8 = 25;
+const FURNACE_RESULT: u8 = 26;
 const HOTBAR: u8 = 28;
 const INVENTORY: u8 = 29;
+const SHULKER_BOX: u8 = 30;
 const OFFHAND: u8 = 34;
+const BLAST_FURNACE_INGREDIENT: u8 = 45;
+const SMOKER_INGREDIENT: u8 = 46;
+const BARREL: u8 = 58;
 const CURSOR: u8 = 59;
 const CREATED: u8 = 60;
+
+/// A Horizon container menu open on Bedrock.
+pub(super) struct Open {
+    /// Bedrock window id (the Java one, which fits in a byte) and Bedrock window type.
+    pub window: u8,
+    pub java_window: i32,
+    pub kind: u8,
+    /// The container's own slots, in Java menu order.
+    pub slots: Vec<Option<Item>>,
+    /// Furnace, blast furnace or smoker: ingredient, fuel, result.
+    pub furnace: bool,
+}
 
 /// A slot named in a request: Bedrock container and slot.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,16 +69,47 @@ enum Place {
     Inv(u8),
     Cursor,
     Created,
+    /// A slot of the open container, in Java menu order.
+    Container(u8),
 }
 
-fn place(s: SlotRef) -> Option<Place> {
-    match (s.container, s.slot) {
-        (HOTBAR | INVENTORY | COMBINED, 0..=35) => Some(Place::Inv(s.slot)),
-        (ARMOR, 0..=3) => Some(Place::Inv(39 - s.slot)), // Bedrock head..feet, Java feet (36)..head (39)
-        (OFFHAND, _) => Some(Place::Inv(40)),
-        (CURSOR, _) => Some(Place::Cursor),
-        (CREATED, _) => Some(Place::Created),
-        _ => None,
+impl Session {
+    fn place(&self, s: SlotRef) -> Option<Place> {
+        let open = self.open.as_ref();
+        let size = open.map_or(0, |o| o.slots.len());
+        let furnace = open.is_some_and(|o| o.furnace);
+        match (s.container, s.slot) {
+            (HOTBAR | INVENTORY | COMBINED, 0..=35) => Some(Place::Inv(s.slot)),
+            (ARMOR, 0..=3) => Some(Place::Inv(39 - s.slot)), // Bedrock head..feet, Java feet (36)..head (39)
+            (OFFHAND, _) => Some(Place::Inv(40)),
+            (CURSOR, _) => Some(Place::Cursor),
+            (CREATED, _) => Some(Place::Created),
+            (LEVEL_ENTITY | SHULKER_BOX | BARREL, s) if (s as usize) < size && !furnace => Some(Place::Container(s)),
+            // Java furnace menus: 0 ingredient, 1 fuel, 2 result.
+            (FURNACE_INGREDIENT | BLAST_FURNACE_INGREDIENT | SMOKER_INGREDIENT, _) if furnace => Some(Place::Container(0)),
+            (FURNACE_FUEL, _) if furnace => Some(Place::Container(1)),
+            (FURNACE_RESULT, _) if furnace => Some(Place::Container(2)),
+            _ => None,
+        }
+    }
+
+    /// The Java menu slot of a place, in the open container's window or else the player's inventory menu;
+    /// None for what that window has no slot for (armor and offhand inside a container window).
+    fn menu_slot(&self, p: Place) -> Option<i16> {
+        let Some(open) = &self.open else {
+            return match p {
+                Place::Inv(i) => Some(crate::java::inventory_to_menu(i)),
+                _ => Some(-999),
+            };
+        };
+        let size = open.slots.len() as i16;
+        match p {
+            Place::Container(s) => Some(s as i16),
+            Place::Inv(i @ 0..=8) => Some(size + 27 + i as i16),
+            Place::Inv(i @ 9..=35) => Some(size + i as i16 - 9),
+            Place::Inv(_) => None,
+            _ => Some(-999),
+        }
     }
 }
 
@@ -181,6 +232,7 @@ impl Session {
         w.varuint(requests.len() as u32);
         for req in requests {
             let before = (self.inventory, self.cursor, self.created);
+            let container_before = self.open.as_ref().map(|o| o.slots.clone());
             match self.apply(&req.actions) {
                 Ok((touched, commands)) => {
                     self.to_java.extend(commands);
@@ -190,6 +242,9 @@ impl Session {
                 Err(e) => {
                     println!("Bedrock: inventory request refused ({e}): {:?}", req.actions);
                     (self.inventory, self.cursor, self.created) = before;
+                    if let (Some(open), Some(slots)) = (self.open.as_mut(), container_before) {
+                        open.slots = slots;
+                    }
                     w.u8(1).varint(req.id).bool(false); // error; the client puts its items back
                 }
             }
@@ -202,6 +257,7 @@ impl Session {
             Place::Inv(i) => self.inventory[i as usize],
             Place::Cursor => self.cursor,
             Place::Created => self.created,
+            Place::Container(s) => self.open.as_ref().and_then(|o| o.slots.get(s as usize).copied().flatten()),
         }
     }
 
@@ -211,24 +267,30 @@ impl Session {
             Place::Inv(i) => self.inventory[i as usize] = item,
             Place::Cursor => self.cursor = item,
             Place::Created => {} // the creative output never runs out
+            Place::Container(s) => {
+                if let Some(slot) = self.open.as_mut().and_then(|o| o.slots.get_mut(s as usize)) {
+                    *slot = item;
+                }
+            }
         }
     }
 
     /// Applies the actions to the model; returns the slots to report and the commands for Horizon.
     fn apply(&mut self, actions: &[Action]) -> Result<(Vec<SlotRef>, Vec<Command>), String> {
-        let creative = self.game_mode == 1;
+        // Creative edits only reach the player's own inventory; with a container open, moves are clicks.
+        let creative = self.game_mode == 1 && self.open.is_none();
         let before = self.inventory;
         let mut touched = Vec::new();
         let mut java = Vec::new();
-        let at = |s: SlotRef| place(s).ok_or(format!("container {} slot {} not handled", s.container, s.slot));
-        let menu = |p: Place| match p {
-            Place::Inv(i) => crate::java::inventory_to_menu(i),
-            _ => -999,
-        };
+        let window = self.open.as_ref().map_or(0, |o| o.java_window);
+        let at = |s: &Session, r: SlotRef| s.place(r).ok_or(format!("container {} slot {} not handled", r.container, r.slot));
+        let menu_of = |s: &Session, p: Place| s.menu_slot(p).ok_or_else(|| "armor or offhand from a container window".to_string());
         let click = |java: &mut Vec<Command>, slot: i16, button: i8, mode: i32, times: u32| {
-            java.extend((0..times).map(|_| Command::Click { slot, button, mode }));
+            java.extend((0..times).map(|_| Command::Click { window, slot, button, mode }));
         };
         for a in actions {
+            let menu = |p: Place| menu_of(self, p);
+            let at = |r: SlotRef| at(self, r);
             match *a {
                 Action::Move { count, src, dst } => {
                     let (from, to) = (at(src)?, at(dst)?);
@@ -242,17 +304,17 @@ impl Session {
                         let cursor_free = self.cursor.is_none();
                         match (from, to) {
                             (Place::Created, _) => return Err("creative menu outside creative".into()),
-                            (Place::Cursor, _) if count == s.count => click(&mut java, menu(to), 0, 0, 1),
-                            (Place::Cursor, _) => click(&mut java, menu(to), 1, 0, count as u32),
+                            (Place::Cursor, _) if count == s.count => click(&mut java, menu(to)?,0, 0, 1),
+                            (Place::Cursor, _) => click(&mut java, menu(to)?,1, 0, count as u32),
                             (_, _) if !cursor_free => return Err("cursor not empty".into()),
                             (_, Place::Cursor) if count == s.count.div_ceil(2) && count < s.count => {
-                                click(&mut java, menu(from), 1, 0, 1); // a right click takes half
+                                click(&mut java, menu(from)?,1, 0, 1); // a right click takes half
                             }
                             _ => {
-                                click(&mut java, menu(from), 0, 0, 1); // pick the stack up
-                                click(&mut java, menu(from), 1, 0, (s.count - count) as u32); // put the rest back
+                                click(&mut java, menu(from)?,0, 0, 1); // pick the stack up
+                                click(&mut java, menu(from)?,1, 0, (s.count - count) as u32); // put the rest back
                                 if to != Place::Cursor {
-                                    click(&mut java, menu(to), 0, 0, 1);
+                                    click(&mut java, menu(to)?,0, 0, 1);
                                 }
                             }
                         }
@@ -265,11 +327,11 @@ impl Session {
                     let (pa, pb) = (at(a)?, at(b)?);
                     if !creative {
                         match (pa, pb) {
-                            (Place::Cursor, p) | (p, Place::Cursor) => click(&mut java, menu(p), 0, 0, 1),
+                            (Place::Cursor, p) | (p, Place::Cursor) => click(&mut java, menu(p)?,0, 0, 1),
                             _ if self.cursor.is_some() => return Err("cursor not empty".into()),
                             _ => {
                                 for p in [pa, pb, pa] {
-                                    click(&mut java, menu(p), 0, 0, 1);
+                                    click(&mut java, menu(p)?,0, 0, 1);
                                 }
                             }
                         }
@@ -288,9 +350,9 @@ impl Session {
                     } else if p == Place::Cursor {
                         if all { click(&mut java, -999, 0, 0, 1) } else { click(&mut java, -999, 1, 0, count as u32) }
                     } else if all {
-                        click(&mut java, menu(p), 1, 4, 1); // throw the stack
+                        click(&mut java, menu(p)?,1, 4, 1); // throw the stack
                     } else {
-                        click(&mut java, menu(p), 0, 4, count as u32); // throw one
+                        click(&mut java, menu(p)?,0, 4, count as u32); // throw one
                     }
                     self.set(p, Some(Item { count: s.count - count, ..s }));
                     touched.push(src);
@@ -339,7 +401,7 @@ impl Session {
         for (container, slots) in containers {
             w.u8(container).bool(false).varuint(slots.len() as u32); // no dynamic id
             for slot in slots {
-                let count = place(SlotRef { container, slot }).and_then(|p| self.get(p)).map_or(0, |i| i.count);
+                let count = self.place(SlotRef { container, slot }).and_then(|p| self.get(p)).map_or(0, |i| i.count);
                 w.u8(slot).u8(slot).u8(count);
                 if count > 0 {
                     self.net_id += 1;
@@ -411,11 +473,11 @@ mod tests {
         let main9 = SlotRef { container: INVENTORY, slot: 9 };
         // Take 4 of 10 to the cursor: pick all up (left), put 6 back one by one (right).
         let (_, java) = s.apply(&[Action::Move { count: 4, src: hotbar0, dst: cursor }]).unwrap();
-        let clicks: Vec<_> = java.iter().map(|c| match c { Command::Click { slot, button, mode } => (*slot, *button, *mode), _ => panic!() }).collect();
+        let clicks: Vec<_> = java.iter().map(|c| match c { Command::Click { window: 0, slot, button, mode } => (*slot, *button, *mode), _ => panic!() }).collect();
         assert_eq!(clicks, [[(36, 0, 0)].as_slice(), &[(36, 1, 0); 6]].concat());
         // Place all 4 into main slot 9 with one left click.
         let (_, java) = s.apply(&[Action::Move { count: 4, src: cursor, dst: main9 }]).unwrap();
-        assert!(matches!(java[..], [Command::Click { slot: 9, button: 0, mode: 0 }]));
+        assert!(matches!(java[..], [Command::Click { window: 0, slot: 9, button: 0, mode: 0 }]));
         assert_eq!((s.inventory[0].unwrap().count, s.inventory[9].unwrap().count, s.cursor), (6, 4, None));
         // Creative-only actions are refused outside creative.
         assert!(s.apply(&[Action::CraftCreative(1)]).is_err());
@@ -426,6 +488,28 @@ mod tests {
         assert_eq!(s.inventory[0].unwrap().count, 5);
         // Taking half is one right click.
         let (_, java) = s.apply(&[Action::Move { count: 3, src: hotbar0, dst: cursor }]).unwrap();
-        assert!(matches!(java[..], [Command::Click { slot: 36, button: 1, mode: 0 }]));
+        assert!(matches!(java[..], [Command::Click { window: 0, slot: 36, button: 1, mode: 0 }]));
+    }
+
+    #[test]
+    fn chest_moves_are_clicks_in_its_window() {
+        let mut s = Session { game_mode: 1, ..Default::default() }; // creative too: a container needs clicks
+        s.open = Some(Open { window: 3, java_window: 3, kind: 0, slots: vec![None; 27], furnace: false });
+        s.inventory[0] = Some(Item { id: 1, count: 64 });
+        let hotbar0 = SlotRef { container: HOTBAR, slot: 0 };
+        let chest5 = SlotRef { container: LEVEL_ENTITY, slot: 5 };
+        // Shift-click style move of the whole stack: pick up hotbar 0 (Java slot 27 + 27 + 0 = 54), put in chest 5.
+        let (touched, java) = s.apply(&[Action::Move { count: 64, src: hotbar0, dst: chest5 }]).unwrap();
+        let clicks: Vec<_> = java.iter().map(|c| match c { Command::Click { window: 3, slot, button, .. } => (*slot, *button), _ => panic!() }).collect();
+        assert_eq!(clicks, [(54, 0), (5, 0)]);
+        assert_eq!((s.inventory[0], s.open.as_ref().unwrap().slots[5]), (None, Some(Item { id: 1, count: 64 })));
+        assert_eq!(touched, [hotbar0, chest5]);
+        // Main inventory slot 9 is Java menu slot 27 in a 27-slot chest; armor has no slot there.
+        assert_eq!(s.menu_slot(Place::Inv(9)), Some(27));
+        assert_eq!(s.menu_slot(Place::Inv(39)), None);
+        // A furnace: Bedrock's ingredient, fuel and result containers are its Java slots 0, 1 and 2.
+        s.open = Some(Open { window: 4, java_window: 4, kind: 2, slots: vec![None; 3], furnace: true });
+        assert!(s.place(SlotRef { container: FURNACE_FUEL, slot: 1 }) == Some(Place::Container(1)));
+        assert!(s.place(SlotRef { container: LEVEL_ENTITY, slot: 0 }).is_none());
     }
 }

@@ -96,11 +96,64 @@ pub fn bedrock_entity(kind: i32) -> Option<&'static str> {
     JAVA_ENTITIES.lines().nth(usize::try_from(kind).ok()?).filter(|s| !s.is_empty())
 }
 
+/// Java chest and trapped chest states: `state dx dz lead` per line (tools/gen_block_table.py).
+static JAVA_CHESTS: &str = include_str!("../data/java_chests.txt");
+
+/// For a Java chest state: the offset of its other half (0, 0 when single) and whether it leads on Bedrock.
+fn chest(state: u32) -> Option<(i32, i32, bool)> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<u32, (i32, i32, bool)>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        JAVA_CHESTS
+            .lines()
+            .filter_map(|l| {
+                let v: Vec<i32> = l.split_whitespace().filter_map(|n| n.parse().ok()).collect();
+                Some((u32::try_from(*v.first()?).ok()?, (*v.get(1)?, *v.get(2)?, *v.get(3)? == 1)))
+            })
+            .collect()
+    });
+    table.get(&state).copied()
+}
+
+/// Bedrock block entity data (network NBT) for a chest: a double chest names its other half (and the right
+/// half leads), as Geyser does, so Bedrock pairs the two the way Java does and shows its 54 slots in order.
+pub fn chest_nbt(pos: [i32; 3], state: u32) -> Option<Vec<u8>> {
+    let (dx, dz, lead) = chest(state)?;
+    let mut n = vec![10, 0]; // compound, empty name
+    let tag = |n: &mut Vec<u8>, kind: u8, name: &str| {
+        n.push(kind);
+        uvarint(n, name.len() as u32);
+        n.extend(name.as_bytes());
+    };
+    tag(&mut n, 8, "id");
+    uvarint(&mut n, 5);
+    n.extend(b"Chest");
+    for (name, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+        tag(&mut n, 3, name);
+        varint(&mut n, v);
+    }
+    tag(&mut n, 1, "isMovable");
+    n.push(1);
+    if (dx, dz) != (0, 0) {
+        tag(&mut n, 3, "pairx");
+        varint(&mut n, pos[0] + dx);
+        tag(&mut n, 3, "pairz");
+        varint(&mut n, pos[2] + dz);
+        if lead {
+            tag(&mut n, 3, "pairlead");
+            varint(&mut n, 1);
+        }
+    }
+    n.push(0);
+    Some(n)
+}
+
 /// Converts the section data of a Java 26.3 chunk packet (24 overworld sections, y = -64..320) into a Bedrock
 /// LevelChunk payload. Returns (sub-chunk count, payload).
 /// shortcut: every biome becomes plains; real biomes need the Java biome registry mapped to Bedrock ids.
-pub fn java_chunk_to_bedrock(mut data: &[u8]) -> Result<(u32, Vec<u8>), String> {
+/// Chunk `cx, cz`: its chests' block entity data follows the payload, so Bedrock pairs double chests on load.
+pub fn java_chunk_to_bedrock(mut data: &[u8], cx: i32, cz: i32) -> Result<(u32, Vec<u8>), String> {
     let mut p = Vec::new();
+    let mut entities = Vec::new();
     for section in 0..OVERWORLD_SUBCHUNKS {
         take(&mut data, 4)?; // block count, fluid count (i16 each)
         let java = read_paletted(&mut data, 4096, 8)?; // index y<<8 | z<<4 | x
@@ -109,6 +162,10 @@ pub fn java_chunk_to_bedrock(mut data: &[u8]) -> Result<(u32, Vec<u8>), String> 
         for (j, &state) in java.iter().enumerate() {
             let (y, z, x) = (j >> 8, (j >> 4) & 15, j & 15);
             bedrock[x << 8 | z << 4 | y] = java_block(state);
+            if chest(state).is_some() {
+                let pos = [cx * 16 + x as i32, (section as i32 - 4) * 16 + y as i32, cz * 16 + z as i32];
+                entities.extend(chest_nbt(pos, state).unwrap_or_default());
+            }
         }
         write_subchunk(&mut p, section as i8 - 4, &bedrock);
     }
@@ -117,6 +174,7 @@ pub fn java_chunk_to_bedrock(mut data: &[u8]) -> Result<(u32, Vec<u8>), String> 
         varint(&mut p, PLAINS);
     }
     p.push(0); // no border blocks
+    p.extend(entities); // block entities: network NBT compounds, one after another
     Ok((OVERWORLD_SUBCHUNKS as u32, p))
 }
 
@@ -195,6 +253,14 @@ fn write_subchunk(p: &mut Vec<u8>, y_index: i8, blocks: &[u32; 4096]) {
     }
 }
 
+fn uvarint(out: &mut Vec<u8>, mut v: u32) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
 fn varint(out: &mut Vec<u8>, v: i32) {
     let mut u = ((v << 1) ^ (v >> 31)) as u32;
     while u >= 0x80 {
@@ -220,6 +286,22 @@ mod tests {
         assert_eq!(java_block(0), block_hash("minecraft:air"), "Java state 0 is air");
         assert_eq!(java_block(1), block_hash("minecraft:stone"), "Python generator and Rust hash agree");
         assert_eq!(java_block(u32::MAX), block_hash("minecraft:air"));
+    }
+
+    #[test]
+    fn double_chest_pairing() {
+        // Java 26.3 state 5545: chest facing north, type left: its other half is east (x + 1), and the right
+        // half leads (Geyser's convention).
+        let left = chest_nbt([10, 64, -3], 5545).unwrap();
+        let has = |nbt: &[u8], name: &str| nbt.windows(name.len()).any(|w| w == name.as_bytes());
+        assert!(has(&left, "Chest") && has(&left, "pairx") && !has(&left, "pairlead"));
+        let pairx = left.windows(6).position(|w| w == b"\x05pairx").unwrap() + 6;
+        assert_eq!(left[pairx], 22, "pairx 11 (zigzag)");
+        // A single chest (state 5543) names no other half; stone isn't a chest.
+        assert!(!has(&chest_nbt([0, 0, 0], 5543).unwrap(), "pairx"));
+        assert!(chest_nbt([0, 0, 0], 1).is_none());
+        let right_north = JAVA_CHESTS.lines().find(|l| l.ends_with(" -1 0 1")).expect("north right half leads");
+        assert!(right_north.starts_with("554"));
     }
 
     #[test]
@@ -255,7 +337,7 @@ mod tests {
         for s in 0..24 {
             java_section(&mut data, s == 8); // section 8 = y 64..79
         }
-        let (count, p) = java_chunk_to_bedrock(&data).unwrap();
+        let (count, p) = java_chunk_to_bedrock(&data, 0, 0).unwrap();
         assert_eq!(count, 24);
         let air = block_hash("minecraft:air");
         assert_eq!(&p[..4], &[9, 1, 0xFC, 1][..], "air section: single-value storage");
@@ -266,7 +348,7 @@ mod tests {
         // every 16-bit group: each word = 0b...0001_0000_0000_0000_0001 inverted (stone=0, air=1).
         let at = p.windows(4).position(|w| w == [9, 1, 4, 3]).expect("1-bit section at y index 4");
         assert_eq!(u32::from_le_bytes(p[at + 4..at + 8].try_into().unwrap()), 0xFFFE_FFFE);
-        assert!(java_chunk_to_bedrock(&data[..10]).is_err(), "truncated data is an error, not a panic");
+        assert!(java_chunk_to_bedrock(&data[..10], 0, 0).is_err(), "truncated data is an error, not a panic");
     }
 
     #[test]
