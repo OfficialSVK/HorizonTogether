@@ -15,6 +15,9 @@ use tokio_raknet::transport::{RaknetListener, RaknetListenerConfig};
 const BEDROCK_PROTOCOL: u32 = 2225;
 const BEDROCK_VERSION: &str = "26.60";
 
+/// Horizon's address (host:port), for joining it on behalf of Bedrock players.
+static HORIZON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The text a Bedrock client parses out of the RakNet unconnected pong.
 fn pong(guid: u64, port: u16, s: &java::Status) -> Vec<u8> {
     let motd = s.motd.lines().next().unwrap_or("").replace(';', ":");
@@ -36,6 +39,7 @@ async fn main() -> std::io::Result<()> {
         .expect("bedrock_bind must be ip:port");
 
     str0m::crypto::from_feature_flags().install_process_default();
+    HORIZON.set(horizon.clone()).expect("set once");
     let guid = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
     let offline = || java::Status { motd: "Horizon server is offline".into(), online: 0, max: 0 };
     let mut listener = RaknetListener::bind_with_config(

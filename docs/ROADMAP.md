@@ -19,11 +19,10 @@ Horizon runs in offline mode, so the bridge is the only thing that can stop some
 
 Replace the flat test world with Horizon's real world. Horizon speaks vanilla Java 26.3 (protocol 777) and runs in offline mode.
 
-1. Handshake (next state = login), then Login Start with the verified gamertag (prefixed, for example `.Steve`, so it can't
-   collide with Java names), then the configuration phase (registries, known packs), then Play.
-2. Translate Java chunks into Bedrock sub-chunks. Block-state mappings come from
-   [GeyserMC/mappings](https://github.com/GeyserMC/mappings) (MIT). The flat-world encoder in `src/world.rs` shows the Bedrock format.
-3. Translate movement (Bedrock PlayerAuthInput to Java, and Java position to Bedrock MovePlayer), chat, block break/place, and entities.
+1. ~~Login, configuration and play as `.gamertag`~~ (done, `src/java.rs`).
+2. ~~Translate Java chunks into Bedrock sub-chunks~~ (done, `src/world.rs`). Still to do: biomes, and block entities.
+3. **Next:** movement from Bedrock to Java (PlayerAuthInput to `move_player_pos_rot` at feet height, moving the chunk
+   publisher along), then other players and entities (PlayerList, AddPlayer), chat, and block break/place.
 4. Consider [`azalea-protocol`](https://github.com/azalea-rs/azalea) for Java packets once it supports 26.3 (it supports 26.2 now).
 
 Geyser (MIT) is the reference translator. Port its logic and credit it.

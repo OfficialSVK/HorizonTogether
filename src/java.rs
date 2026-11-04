@@ -1,4 +1,5 @@
-//! Minimal Java Edition client side: just the Server List Ping (status) for now.
+//! Java Edition 26.3 client side: the Server List Ping, and joining Horizon as a player.
+//! Packet ids: MCProtocolLib's MinecraftCodec registration order (Geyser's Java library).
 use serde_json::Value;
 use std::io;
 use std::time::Duration;
@@ -108,10 +109,223 @@ pub async fn status(addr: &str) -> io::Result<Status> {
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status ping timed out"))?
 }
 
+/// Java name for a Bedrock gamertag: `.` prefix (as Floodgate does) so it can't collide with a Java account,
+/// spaces (allowed in gamertags, not in Java names) as `_`, at most 16 characters.
+pub fn java_name(gamertag: &str) -> String {
+    format!(".{}", gamertag.replace(' ', "_")).chars().take(16).collect()
+}
+
+/// Largest Java packet we accept (vanilla's own limit is 2 MiB compressed, 8 MiB uncompressed).
+const MAX_PACKET: usize = 8 << 20;
+
+/// A Java connection: length-prefixed packets, zlib-compressed once the server enables it.
+struct Conn {
+    s: TcpStream,
+    threshold: Option<usize>,
+}
+
+impl Conn {
+    async fn send(&mut self, id: i32, payload: &[u8]) -> io::Result<()> {
+        let mut body = Vec::with_capacity(payload.len() + 5);
+        write_varint(&mut body, id);
+        body.extend(payload);
+        let framed = match self.threshold {
+            None => body,
+            Some(t) if body.len() < t => [&[0u8][..], &body].concat(), // data length 0: not compressed
+            Some(_) => {
+                let mut f = Vec::new();
+                write_varint(&mut f, body.len() as i32);
+                f.extend(miniz_oxide::deflate::compress_to_vec_zlib(&body, 6));
+                f
+            }
+        };
+        self.s.write_all(&frame(framed)).await
+    }
+
+    async fn recv(&mut self) -> io::Result<(i32, Vec<u8>)> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        let len = read_varint(&mut self.s).await? as usize;
+        if len > MAX_PACKET {
+            return Err(bad("packet too large"));
+        }
+        let mut buf = vec![0u8; len];
+        self.s.read_exact(&mut buf).await?;
+        let mut r = &buf[..];
+        let body = match self.threshold {
+            None => r.to_vec(),
+            Some(_) => match read_varint(&mut r).await? as usize {
+                0 => r.to_vec(),
+                n if n > MAX_PACKET => return Err(bad("packet too large")),
+                n => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(r, n).map_err(|_| bad("bad zlib data"))?,
+            },
+        };
+        let mut r = &body[..];
+        let id = read_varint(&mut r).await?;
+        Ok((id, r.to_vec()))
+    }
+}
+
+/// What Horizon tells the bridge about the world, for the Bedrock side to translate.
+pub enum Event {
+    /// Player feet position and rotation (absolute).
+    Position { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
+    /// A chunk column: the section data of a level_chunk_with_light packet.
+    Chunk { x: i32, z: i32, data: Vec<u8> },
+}
+
+/// Joins Horizon as a Java player and keeps the session alive until the server disconnects us or
+/// the Bedrock side goes away (the event receiver is dropped).
+pub async fn play(addr: String, name: String, events: std::sync::mpsc::Sender<Event>) -> io::Result<()> {
+    let (host, port) = addr
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h.to_string(), p.parse::<u16>().ok()?)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected host:port"))?;
+    let mut c = Conn { s: TcpStream::connect(&addr).await?, threshold: None };
+
+    let mut hs = Vec::new();
+    write_varint(&mut hs, PROTOCOL);
+    write_string(&mut hs, &host);
+    hs.extend(port.to_be_bytes());
+    write_varint(&mut hs, 2); // intent: login
+    c.send(0x00, &hs).await?;
+    let mut hello = Vec::new();
+    write_string(&mut hello, &name);
+    hello.extend([0u8; 16]); // profile id: an offline server derives its own from the name
+    c.send(0x00, &hello).await?;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Login,
+        Config,
+        Game,
+    }
+    let mut state = State::Login;
+    let (mut loaded, mut chunks) = (false, 0u32);
+    loop {
+        let (id, body) = c.recv().await?;
+        let mut r = &body[..];
+        match (state, id) {
+            (State::Login, 0x00) | (State::Config, 0x02) | (State::Game, 0x20) => {
+                let reason = String::from_utf8_lossy(&body).chars().filter(|ch| !ch.is_control()).collect::<String>();
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("Horizon disconnected {name}: {reason}")));
+            }
+            (State::Login, 0x01) => {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Horizon is in online mode; the bridge needs online_mode = false"));
+            }
+            (State::Login, 0x03) => c.threshold = Some(read_varint(&mut r).await?.max(0) as usize),
+            (State::Login, 0x04) => {
+                // Plugin request: answer "not understood" (transaction id, no data).
+                let mut a = Vec::new();
+                write_varint(&mut a, read_varint(&mut r).await?);
+                a.push(0);
+                c.send(0x02, &a).await?;
+            }
+            (State::Login, 0x02) => {
+                c.send(0x03, &[]).await?; // login acknowledged
+                state = State::Config;
+                let mut info = Vec::new();
+                write_string(&mut info, "en_us");
+                info.extend([8, 0, 1, 0x7f, 1, 0, 1, 0]); // view distance, chat on, colours, skin parts, right hand, no filter, listed, particles all
+                c.send(0x00, &info).await?;
+            }
+            (State::Config, 0x0f) => c.send(0x07, &body).await?, // we "know" every pack offered, so registries come by reference
+            (State::Config, 0x04) => c.send(0x04, &body).await?, // keep alive
+            (State::Config, 0x05) => c.send(0x05, &body).await?, // ping -> pong
+            (State::Config, 0x14) => c.send(0x09, &[]).await?,   // accept the code of conduct
+            (State::Config, 0x03) => {
+                c.send(0x03, &[]).await?;
+                state = State::Game;
+                println!("Java: {name} joined Horizon");
+            }
+            (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
+            (State::Game, 0x3e) => c.send(0x2d, &body).await?, // ping -> pong
+            (State::Game, 0x49) => {
+                // player_position: id, pos (3 f64), delta (3 f64), yRot, xRot (f32), flags. 26.3's accept_teleportation
+                // echoes the id, position and rotation.
+                // shortcut: echoes the values as absolute; relative teleports need the tracked position (movement translation).
+                let teleport = read_varint(&mut r).await?;
+                let rest = r.get(..60).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short player_position"))?;
+                let mut a = Vec::new();
+                write_varint(&mut a, teleport);
+                a.extend(&rest[..24]);
+                a.extend(&rest[48..56]);
+                c.send(0x00, &a).await?;
+                let f64_at = |i: usize| f64::from_be_bytes(rest[i..i + 8].try_into().unwrap());
+                let f32_at = |i: usize| f32::from_be_bytes(rest[i..i + 4].try_into().unwrap());
+                let (x, y, z) = (f64_at(0), f64_at(8), f64_at(16));
+                if events.send(Event::Position { x, y, z, yaw: f32_at(48), pitch: f32_at(52) }).is_err() {
+                    return Ok(()); // the Bedrock player left
+                }
+                if !loaded {
+                    println!("Java: {name} is at {x:.1} {y:.1} {z:.1} on Horizon");
+                    c.send(0x2c, &[]).await?; // player loaded
+                    loaded = true;
+                }
+            }
+            (State::Game, 0x0b) => c.send(0x0b, &20f32.to_be_bytes()).await?, // chunk batch received; desired chunks per tick
+            (State::Game, 0x2e) => {
+                // level_chunk_with_light: x, z (i32), heightmaps [type, long[]], section data (byte[]), then
+                // block entities and light, which we don't use yet.
+                let bad = || io::Error::new(io::ErrorKind::InvalidData, "short level_chunk_with_light");
+                let (x, z) = (i32::from_be_bytes(r.get(..4).ok_or_else(bad)?.try_into().unwrap()), i32::from_be_bytes(r.get(4..8).ok_or_else(bad)?.try_into().unwrap()));
+                r = &r[8..];
+                for _ in 0..read_varint(&mut r).await? {
+                    read_varint(&mut r).await?; // heightmap type
+                    let longs = read_varint(&mut r).await? as usize;
+                    r = r.get(longs * 8..).ok_or_else(bad)?;
+                }
+                let len = read_varint(&mut r).await? as usize;
+                let data = r.get(..len).ok_or_else(bad)?.to_vec();
+                if events.send(Event::Chunk { x, z, data }).is_err() {
+                    return Ok(());
+                }
+                chunks += 1;
+                if chunks == 1 || chunks % 100 == 0 {
+                    println!("Java: {name} received {chunks} chunks from Horizon");
+                }
+            }
+            (State::Game, 0x78) => {
+                c.send(0x10, &[]).await?; // configuration acknowledged
+                state = State::Config;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn java_names() {
+        assert_eq!(java_name("Sergiy22889917"), ".Sergiy22889917");
+        assert_eq!(java_name("Cool Gamer"), ".Cool_Gamer");
+        assert_eq!(java_name("ABCDEFGHIJKLMNOPQRS").len(), 16);
+    }
+
+    /// Manual check against a running offline Horizon server: `cargo test -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn joins_local_horizon() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx)).await;
+        assert!(r.is_err(), "still connected after 8 s (expected); ended early with {r:?}");
+        // Every chunk Horizon sent must translate into a Bedrock chunk.
+        let (mut chunks, mut pos) = (0, None);
+        for e in rx.try_iter() {
+            match e {
+                Event::Chunk { data, .. } => {
+                    crate::world::java_chunk_to_bedrock(&data).expect("translates");
+                    chunks += 1;
+                }
+                Event::Position { x, y, z, .. } => pos = Some((x, y, z)),
+            }
+        }
+        println!("translated {chunks} chunks; position {pos:?}");
+        assert!(chunks > 0 && pos.is_some());
+    }
 
     #[test]
     fn flattens_components() {

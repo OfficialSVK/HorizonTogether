@@ -42,18 +42,59 @@ const PLAYER_SPAWN: i32 = 3;
 /// Largest decompressed batch we accept from a client (a Login with skin data is the biggest).
 const MAX_BATCH: usize = 16 << 20;
 
-#[derive(Default)]
 pub struct Session {
     compressed: bool,
+    /// The world comes from Horizon rather than the flat test world.
+    linked: bool,
+    /// Horizon has told us where the player is.
+    java_ready: bool,
+    /// Player feet position and [pitch, yaw], as Horizon last sent them.
+    pos: [f32; 3],
+    rot: [f32; 2],
+    /// Granted chunk radius.
+    radius: i32,
+    /// Translated Horizon chunks waiting for the spawn sequence.
+    pending: Vec<Vec<u8>>,
     /// The spawn packets (chunks, player state) have been sent.
     spawned: bool,
     /// When the client reported ServerboundLoadingScreen(start).
     loading_started: Option<std::time::Instant>,
     spawn_status_sent: bool,
+    /// Set by Login; see `take_joined`.
+    joined: Option<String>,
     /// Unhandled packet ids already logged, so per-tick packets don't flood the log.
     logged: std::collections::HashSet<u32>,
     /// Set once a recorded join stream has been replayed (dev tool, see REPLAY_ENV).
     replay: Option<()>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            compressed: false,
+            linked: false,
+            java_ready: false,
+            pos: [0.5, 64.0, 0.5], // flat test world: standing on the grass
+            rot: [0.0, 0.0],
+            radius: 8,
+            pending: Vec::new(),
+            spawned: false,
+            loading_started: None,
+            spawn_status_sent: false,
+            joined: None,
+            logged: Default::default(),
+            replay: None,
+        }
+    }
+}
+
+/// LevelChunk body: position, overworld, sub-chunk count, no request limit, no blob cache, payload.
+fn level_chunk(x: i32, z: i32, count: u32, payload: &[u8]) -> Vec<u8> {
+    let mut c = W::default();
+    c.varint(x).varint(z).varint(0).varuint(count);
+    c.u8(0).bool(false).varuint(0);
+    c.varuint(payload.len() as u32).bytes(payload).bool(false);
+    c.0
 }
 
 /// Dev tool: path to a recorded server->client join stream (`[u32 id][u32 len][payload]`, little-endian),
@@ -133,6 +174,7 @@ impl Session {
                         "Bedrock: Login from {} (XUID {}, protocol {}) - identity NOT verified yet",
                         who.name, who.xuid, who.protocol
                     );
+                    self.joined = Some(crate::java::java_name(&who.name));
                     // No game-layer encryption: NetherNet already runs over DTLS, and the handshake is server-optional.
                     let mut info = W::default();
                     info.bool(false).bool(false).bool(false).bool(false); // pack required, addons, scripts, no vibrant visuals
@@ -184,20 +226,24 @@ impl Session {
                 REQUEST_CHUNK_RADIUS if self.replay.is_some() => {} // the recording already answers it
                 REQUEST_CHUNK_RADIUS => {
                     let wanted = zigzag(read_uvarint(&mut packet)?);
-                    let radius = wanted.clamp(2, 8);
-                    println!("Bedrock: client wants chunk radius {wanted}, granting {radius}; sending flat test chunks");
+                    self.radius = wanted.clamp(2, 8);
+                    let radius = self.radius;
                     let mut packets = vec![packet_bytes(CHUNK_RADIUS_UPDATED, &W::default().varint(radius).0)];
-                    let mut publisher = W::default();
-                    publisher.varint(0).varint(64).varint(0).varuint(radius as u32 * 16).bytes(&0u32.to_le_bytes());
-                    packets.push(packet_bytes(NETWORK_CHUNK_PUBLISHER_UPDATE, &publisher.0));
-                    let (count, payload) = crate::world::flat_chunk();
-                    for x in -radius..=radius {
-                        for z in -radius..=radius {
-                            let mut c = W::default();
-                            c.varint(x).varint(z).varint(0).varuint(count); // position, overworld, sub-chunks
-                            c.u8(0).bool(false).varuint(0); // no sub-chunk request limit, no blob cache
-                            c.varuint(payload.len() as u32).bytes(&payload).bool(false);
-                            packets.push(packet_bytes(LEVEL_CHUNK, &c.0));
+                    packets.push(self.publisher());
+                    if self.linked {
+                        println!("Bedrock: chunk radius {radius}; sending {} Horizon chunks so far", self.pending.len());
+                        // In batches of 64 chunks, like BDS's ~200 KB batches, rather than one huge one.
+                        out.push(self.batch(&std::mem::take(&mut packets)));
+                        for group in std::mem::take(&mut self.pending).chunks(64) {
+                            out.push(self.batch(group));
+                        }
+                    } else {
+                        println!("Bedrock: chunk radius {radius}; sending flat test chunks");
+                        let (count, payload) = crate::world::flat_chunk();
+                        for x in -radius..=radius {
+                            for z in -radius..=radius {
+                                packets.push(packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload)));
+                            }
                         }
                     }
                     if !self.spawned {
@@ -210,15 +256,12 @@ impl Session {
                         packets.push(packet_bytes(SET_PLAYER_GAME_TYPE, &W::default().varint(1).0)); // creative
                         // Vanilla servers treat the first spawn as a respawn: Respawn(ready to spawn, runtime id 0),
                         // then metadata, then MovePlayer(respawn). Geyser does the same ("Bedrock server behavior").
+                        let [x, y, z] = self.eye();
                         let mut respawn = W::default();
-                        respawn.f32(0.5).f32(66.0).f32(0.5).u8(1).varuint64(0);
+                        respawn.f32(x).f32(y).f32(z).u8(1).varuint64(0);
                         packets.push(packet_bytes(RESPAWN, &respawn.0));
                         packets.push(packet_bytes(SET_ACTOR_DATA, &player_metadata()));
-                        let mut mv = W::default();
-                        mv.varuint64(1).f32(0.5).f32(66.0).f32(0.5).f32(0.0).f32(0.0).f32(0.0); // runtime id, position, pitch, yaw, head yaw
-                        mv.u8(1).bool(true).varuint64(0); // mode: reset, on ground, not riding
-                        mv.bool(false).varuint64(0); // teleport data (optional, absent), input tick 0
-                        packets.push(packet_bytes(MOVE_PLAYER, &mv.0));
+                        packets.push(self.move_player());
                         self.spawned = true;
                     }
                     packets.extend(self.spawn_status());
@@ -246,6 +289,61 @@ impl Session {
         Ok(out)
     }
 
+    /// The Java name of a player who just logged in, once: the transport then joins Horizon with it.
+    pub fn take_joined(&mut self) -> Option<String> {
+        self.joined.take()
+    }
+
+    /// From now on the world comes from Horizon (via `on_java`) instead of the flat test world.
+    pub fn set_linked(&mut self) {
+        self.linked = true;
+    }
+
+    /// Translates what Horizon sends into Bedrock packets.
+    pub fn on_java(&mut self, event: crate::java::Event) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        match event {
+            crate::java::Event::Position { x, y, z, yaw, pitch } => {
+                self.pos = [x as f32, y as f32, z as f32];
+                self.rot = [pitch, yaw];
+                self.java_ready = true;
+                if self.spawned {
+                    packets.push(self.publisher());
+                    packets.push(self.move_player());
+                }
+            }
+            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data) {
+                Ok((count, payload)) => {
+                    let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
+                    if self.spawned { packets.push(p) } else { self.pending.push(p) }
+                }
+                Err(e) => eprintln!("Bedrock: can't translate Horizon chunk {x},{z}: {e}"),
+            },
+        }
+        if packets.is_empty() { Vec::new() } else { vec![self.batch(&packets)] }
+    }
+
+    /// Bedrock player positions are at eye height; Java's are at the feet.
+    fn eye(&self) -> [f32; 3] {
+        [self.pos[0], self.pos[1] + 1.62, self.pos[2]]
+    }
+
+    fn publisher(&self) -> Vec<u8> {
+        let mut w = W::default();
+        w.varint(self.pos[0].floor() as i32).varint(self.pos[1].floor() as i32).varint(self.pos[2].floor() as i32);
+        w.varuint(self.radius as u32 * 16).bytes(&0u32.to_le_bytes()); // radius in blocks, no saved chunks
+        packet_bytes(NETWORK_CHUNK_PUBLISHER_UPDATE, &w.0)
+    }
+
+    fn move_player(&self) -> Vec<u8> {
+        let [x, y, z] = self.eye();
+        let mut w = W::default();
+        w.varuint64(1).f32(x).f32(y).f32(z).f32(self.rot[0]).f32(self.rot[1]).f32(self.rot[1]); // runtime id, position, pitch, yaw, head yaw
+        w.u8(1).bool(true).varuint64(0); // mode: reset, on ground, not riding
+        w.bool(false).varuint64(0); // teleport data (optional, absent), input tick 0
+        packet_bytes(MOVE_PLAYER, &w.0)
+    }
+
     /// Time-driven sends; the transport calls this regularly (the client is silent while it waits).
     pub fn poll(&mut self) -> Vec<Vec<u8>> {
         match self.spawn_status() {
@@ -262,7 +360,7 @@ impl Session {
     /// (as we used to, with the chunks) it is lost and the player stays frozen. BDS waits ~2 s here.
     fn spawn_status(&mut self) -> Option<Vec<u8>> {
         // The client also needs time to build the terrain first; BDS waits ~2 s after the chunks.
-        let ready = self.loading_started.is_some_and(|t| t.elapsed() >= SPAWN_DELAY);
+        let ready = self.loading_started.is_some_and(|t| t.elapsed() >= SPAWN_DELAY) && (!self.linked || self.java_ready);
         if !self.spawned || !ready || self.spawn_status_sent {
             return None;
         }
@@ -558,6 +656,8 @@ mod tests {
         let reply = s.on_message(&[&[0x00][..], &deflated].concat()).unwrap();
         assert_eq!(ids(&reply), [PLAY_STATUS, RESOURCE_PACKS_INFO]);
         assert_eq!(ids(&s.on_message(&[&[0xFF][..], &batch].concat()).unwrap()), [PLAY_STATUS, RESOURCE_PACKS_INFO]);
+        assert_eq!(s.take_joined().as_deref(), Some(".Steve"), "login hands the Java name to the transport once");
+        assert_eq!(s.take_joined(), None);
         assert!(s.on_message(&[0x07, 1]).is_err());
 
         let send = |s: &mut Session, id: u32, body: &[u8]| {

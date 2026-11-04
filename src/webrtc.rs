@@ -33,15 +33,27 @@ pub fn answer(offer: &str, local_ip: IpAddr) -> Result<String, Error> {
     let identity = format!("a=identity:{}\r\n", crate::identity::attribute(&crate::identity::new_key(), algorithm, digest));
     let media = answer.find("m=").ok_or("answer has no media section")?;
     answer.insert_str(media, &identity); // session-level, as in the client's offer
+    let rt = tokio::runtime::Handle::current(); // called from the signaling task, so a runtime is present
     std::thread::spawn(move || {
-        if let Err(e) = run(rtc, socket) {
+        if let Err(e) = run(rtc, socket, rt) {
             eprintln!("WebRTC connection ended: {e}");
         }
     });
     Ok(answer)
 }
 
-fn run(mut rtc: Rtc, socket: UdpSocket) -> Result<(), RtcError> {
+/// Aborts the Java session when the Bedrock connection ends, so the player leaves Horizon too.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn run(mut rtc: Rtc, socket: UdpSocket, rt: tokio::runtime::Handle) -> Result<(), RtcError> {
+    let mut _java: Option<AbortOnDrop> = None;
+    let mut java_events: Option<std::sync::mpsc::Receiver<crate::java::Event>> = None;
     let mut reliable = None;
     let mut outbox = VecDeque::new();
     let mut parts: HashMap<_, Reassembler> = HashMap::new();
@@ -49,6 +61,22 @@ fn run(mut rtc: Rtc, socket: UdpSocket) -> Result<(), RtcError> {
     let mut buf = vec![0u8; 2000];
     let mut last_rx = Instant::now();
     loop {
+        if let Some(name) = session.take_joined() {
+            let addr = crate::HORIZON.get().cloned().unwrap_or_default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            java_events = Some(rx);
+            session.set_linked();
+            _java = Some(AbortOnDrop(rt.spawn(async move {
+                if let Err(e) = crate::java::play(addr, name, tx).await {
+                    eprintln!("Java: {e}");
+                }
+            })));
+        }
+        for event in java_events.iter().flat_map(|rx| rx.try_iter()).collect::<Vec<_>>() {
+            for msg in session.on_java(event) {
+                let _ = enqueue(&mut outbox, &msg);
+            }
+        }
         for msg in session.poll() {
             let _ = enqueue(&mut outbox, &msg);
         }
