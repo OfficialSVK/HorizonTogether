@@ -6,6 +6,7 @@ Outputs (in <out_dir>):
   java_items.bin        For each Java item id in order: Bedrock item id (i16), aux (u16), Java block state of the
                         item's block or 0xFFFFFFFF (u32), all little-endian.
   creative_java.bin     For each creative item in order: the Java item id it gives (i32 LE, -1 when none).
+  java_entities.txt     One line per Java entity type id: the Bedrock entity identifier, empty when none.
   block_properties.bin  StartGame's block properties (vanilla blocks defined data-driven), from Geyser's
                         data_driven_blocks.nbt for the same version (read from next to item_components.nbt).
 
@@ -20,7 +21,7 @@ Usage: python -I tools/gen_item_data.py <runtime_item_states.json> <item_compone
            <items.json> <registries.json> <out_dir> [bds_recording.bin]
 With a recording of Mojang's server (tools/bdslog), the two packets are checked byte for byte against it.
 """
-import base64, gzip, json, os, struct, sys
+import base64, gzip, json, os, re, struct, sys
 
 
 def read_nbt(b, le):
@@ -184,6 +185,34 @@ def creative_java(creative, mappings, registries):
     return b"".join(struct.pack("<i", i) for i in ids), missing
 
 
+# Java entity names that Bedrock spells differently (from Geyser's entity definitions).
+ENTITY_RENAMES = {
+    "experience_orb": "xp_orb", "zombified_piglin": "zombie_pigman", "evoker": "evocation_illager",
+    "evoker_fangs": "evocation_fang", "end_crystal": "ender_crystal", "eye_of_ender": "eye_of_ender_signal",
+    "firework_rocket": "fireworks_rocket", "experience_bottle": "xp_bottle", "trident": "thrown_trident",
+    "spectral_arrow": "arrow", "potion": "splash_potion", "snow_golem": "snow_golem", "mooshroom": "mooshroom",
+    "furnace_minecart": "minecart", "spawner_minecart": "minecart", "lightning_bolt": "lightning_bolt",
+    "tropical_fish": "tropicalfish", "fishing_bobber": "fishing_hook", "bamboo_raft": "boat",
+    "bamboo_chest_raft": "chest_boat", "wind_charge": "wind_charge_projectile",
+    "breeze_wind_charge": "breeze_wind_charge_projectile",
+}
+
+
+def java_entities(registries, identifiers_path):
+    """One line per Java entity type id: the Bedrock entity identifier, or empty when Bedrock has none (and
+    for minecraft:item, which Bedrock adds with its own packet)."""
+    bedrock = set(re.findall(rb"minecraft:[a-z0-9_]+", open(identifiers_path, "rb").read()))
+    java = registries["minecraft:entity_type"]["entries"]
+    lines = []
+    for name in sorted(java, key=lambda n: java[n]["protocol_id"]):
+        short = name.split(":", 1)[1]
+        short = ENTITY_RENAMES.get(short, "boat" if short.endswith("_boat") and "chest" not in short
+                                   else "chest_boat" if short.endswith("_chest_boat") else short)
+        b = "minecraft:" + short
+        lines.append(b if b.encode() in bedrock and name != "minecraft:item" else "")
+    return ("\n".join(lines) + "\n").encode(), sum(1 for l in lines if l)
+
+
 def block_properties(blocks):
     """StartGame's block properties: the vanilla blocks Bedrock defines data-driven (concrete stairs...), each a
     name and its definition as network NBT, after a count."""
@@ -220,6 +249,10 @@ def main(states_path, components_path, creative_path, items_path, registries_pat
     files["java_items.bin"] = java
     files["creative_java.bin"], no_java = creative_java(creative, mappings, registries)
     raw = open(blocks_path, "rb").read()
+    # data/entity_identifiers.dat (already in the repo) lists the Bedrock entity identifiers.
+    ident = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "entity_identifiers.dat")
+    files["java_entities.txt"], shown = java_entities(registries, ident)
+    print(f"{shown} Java entity types have a Bedrock entity")
     files["block_properties.bin"] = block_properties(read_nbt(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw, False)[1])
     print(f"{len(creative['items'])} creative items, {len(no_java)} without a Java item: {no_java[:10]}")
     for name, data in files.items():

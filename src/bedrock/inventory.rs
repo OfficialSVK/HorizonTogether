@@ -67,27 +67,36 @@ fn place(s: SlotRef) -> Option<Place> {
 pub(super) fn read_requests(r: &mut &[u8]) -> Result<Vec<Request>, String> {
     let mut out = Vec::new();
     for _ in 0..read_uvarint(r)?.min(100) {
-        let id = zigzag(read_uvarint(r)?);
-        let mut actions = Vec::new();
-        for _ in 0..read_uvarint(r)?.min(100) {
-            match read_action(r) {
-                Ok(a) => actions.push(a),
-                Err(e) => {
-                    eprintln!("Bedrock: inventory request {id}: {e}");
-                    actions.push(Action::Unsupported(u32::MAX));
-                    out.push(Request { id, actions });
-                    return Ok(out);
-                }
-            }
+        let (req, complete) = read_request(r)?;
+        out.push(req);
+        if !complete {
+            break;
         }
-        for _ in 0..read_uvarint(r)? {
-            let n = read_uvarint(r)? as usize;
-            take(r, n)?; // filter strings
-        }
-        take(r, 4)?; // filter cause (i32)
-        out.push(Request { id, actions });
     }
     Ok(out)
+}
+
+/// One request: id, actions, filter strings and their cause. `complete` is false when an action couldn't be
+/// decoded: the request then ends in an Unsupported action (so it is refused) and what follows can't be found.
+pub(super) fn read_request(r: &mut &[u8]) -> Result<(Request, bool), String> {
+    let id = zigzag(read_uvarint(r)?);
+    let mut actions = Vec::new();
+    for _ in 0..read_uvarint(r)?.min(100) {
+        match read_action(r) {
+            Ok(a) => actions.push(a),
+            Err(e) => {
+                eprintln!("Bedrock: inventory request {id}: {e}");
+                actions.push(Action::Unsupported(u32::MAX));
+                return Ok((Request { id, actions }, false));
+            }
+        }
+    }
+    for _ in 0..read_uvarint(r)? {
+        let n = read_uvarint(r)? as usize;
+        take(r, n)?; // filter strings
+    }
+    take(r, 4)?; // filter cause (i32)
+    Ok((Request { id, actions }, true))
 }
 
 /// Container (u8), optional dynamic id (u32), slot (u8), stack net id (i32).
@@ -125,6 +134,14 @@ fn read_action(r: &mut &[u8]) -> Result<Action, String> {
         6 => {
             take(r, 1)?;
             Action::Unsupported(kind) // create (crafting)
+        }
+        11 => {
+            // Mine block: the held tool's predicted wear (hotbar slot and durability as varints, stack net id as
+            // a fixed i32). Horizon wears the Java tool itself; nothing to do.
+            read_uvarint(r)?;
+            read_uvarint(r)?;
+            take(r, 4)?;
+            Action::Ignored
         }
         12 | 14 => {
             let id = read_uvarint(r)?;

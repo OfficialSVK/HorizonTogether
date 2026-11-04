@@ -199,7 +199,7 @@ pub enum Command {
     Chat(String),
     /// A command, without the leading `/`.
     Run(String),
-    /// player_action on a block: 0 start digging (instant in creative), 1 abort, 2 finish. Face 0-5 (down, up, N, S, W, E).
+    /// player_action (see DIG_START and the others). Face 0-5 (down, up, N, S, W, E).
     Dig { status: i32, pos: [i32; 3], face: u8 },
     /// Right-click on a block face with the main hand; cursor is the hit point within the block (0..1).
     UseOn { pos: [i32; 3], face: u8, cursor: [f32; 3] },
@@ -217,6 +217,13 @@ pub enum Command {
     /// The inventory screen closed (container_close, window 0): the server puts the cursor's items back.
     CloseInventory,
 }
+
+/// player_action actions in 26.3 (one more than older versions: 1 is "change destroy direction").
+pub const DIG_START: i32 = 0; // instant in creative
+pub const DIG_ABORT: i32 = 2;
+pub const DIG_FINISH: i32 = 3;
+pub const DROP_ALL: i32 = 4; // the held stack
+pub const DROP_ONE: i32 = 5;
 
 /// Java Inventory index (see Event::Inventory) to the player menu slot (window 0).
 pub fn inventory_to_menu(i: u8) -> i16 {
@@ -252,6 +259,16 @@ pub enum Event {
     Chat { from: Option<String>, text: String, overlay: bool },
     /// Another player appeared: Java entity id, profile UUID (big-endian bytes), name, feet position, rotation.
     AddPlayer { id: i32, uuid: [u8; 16], name: String, pos: [f64; 3], yaw: f32, pitch: f32 },
+    /// Any other entity appeared (a mob, projectile, vehicle...): Java entity id and entity type id.
+    AddEntity { id: i32, kind: i32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
+    /// A dropped item stack appeared.
+    AddItem { id: i32, item: Item, pos: [f64; 3] },
+    /// An entity was hurt (its red flash); `None` is our own player.
+    Hurt(Option<i32>),
+    /// An entity died (its death animation).
+    Death(i32),
+    /// A dropped item was picked up by an entity; `None` is our own player.
+    TakeItem { item: i32, collector: Option<i32> },
     /// A tracked entity's new absolute position and rotation.
     MoveEntity { id: i32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
     /// A tracked entity is gone.
@@ -343,6 +360,40 @@ fn read_varint_sync(r: &mut &[u8]) -> io::Result<i32> {
     Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"))
 }
 
+/// set_entity_data entries (index u8, 0xFF ends; serializer id; value) up to a dropped item's stack (index 8,
+/// serializer 7). Only the value types that come before it are decoded; others end the read with an error.
+fn entity_data_item(mut r: &[u8]) -> io::Result<Option<Item>> {
+    loop {
+        let index = take_bytes(&mut r, 1)?[0];
+        if index == 0xFF {
+            return Ok(None);
+        }
+        match read_varint_sync(&mut r)? {
+            7 => {
+                let item = read_item(&mut r)?;
+                if index == 8 {
+                    return Ok(item);
+                }
+            }
+            0 | 8 => drop(take_bytes(&mut r, 1)?), // byte, boolean
+            1 | 20 => drop(read_varint_sync(&mut r)?), // int, pose
+            2 => drop(read_varlong(&mut r)?),
+            3 => drop(take_bytes(&mut r, 4)?), // float
+            4 => {
+                let n = read_varint_sync(&mut r)? as usize;
+                take_bytes(&mut r, n)?; // string
+            }
+            5 => drop(read_nbt(&mut r)?), // text component
+            6 => {
+                if take_bytes(&mut r, 1)?[0] != 0 {
+                    read_nbt(&mut r)?; // optional text component
+                }
+            }
+            k => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("entity data type {k} not decoded yet"))),
+        }
+    }
+}
+
 /// Player inventory menu (window 0) slot to Java Inventory index: 5-8 armor (head first), 9-35 main, 36-44 hotbar,
 /// 45 offhand. The crafting grid (0-4) has no Inventory index.
 fn menu_to_inventory(slot: i32) -> Option<u8> {
@@ -411,6 +462,8 @@ fn section_blocks(mut r: &[u8]) -> io::Result<Vec<([i32; 3], u32)>> {
 
 /// minecraft:player in the entity_type registry (Java 26.3, from the data generator's registries report).
 const PLAYER_ENTITY_TYPE: i32 = 159;
+/// minecraft:item (a dropped item stack).
+const ITEM_ENTITY_TYPE: i32 = 72;
 
 /// Another player Horizon showed us: kept to turn relative moves into absolute ones.
 struct Tracked {
@@ -717,6 +770,10 @@ pub async fn play(
     let (mut loaded, mut chunks) = (false, 0u32);
     let mut names: std::collections::HashMap<[u8; 16], String> = Default::default();
     let mut tracked: std::collections::HashMap<i32, Tracked> = Default::default();
+    // Dropped items added but not yet sent (their stack comes in set_entity_data): where they are.
+    let mut items_waiting: std::collections::HashMap<i32, [f64; 3]> = Default::default();
+    // Our own entity id (from the play login), to tell our pickups apart.
+    let mut own_id = 0i32;
     let mut sequence = 0i32;
     // State id of the player's inventory menu, from the server's last container_set_content/slot.
     let mut menu_state = 0i32;
@@ -843,6 +900,7 @@ pub async fn play(
                 println!("Java: {name} joined Horizon");
             }
             (State::Game, 0x32) => {
+                own_id = i32::from_be_bytes(take_bytes(&mut r, 4)?.try_into().unwrap()); // login: our entity id first
                 let mode = login_game_mode(&body).await?;
                 if events.send(Event::GameMode(mode)).is_err() {
                     return Ok(());
@@ -878,9 +936,7 @@ pub async fn play(
                 // add_entity: id, uuid, type, position (3 f64), velocity (LpVec3), pitch, yaw, head yaw (angle bytes).
                 let id = read_varint(&mut r).await?;
                 let uuid: [u8; 16] = take_bytes(&mut r, 16)?.try_into().unwrap();
-                if read_varint(&mut r).await? != PLAYER_ENTITY_TYPE {
-                    continue; // shortcut: only players are shown on Bedrock so far; mobs and items come next
-                }
+                let kind = read_varint(&mut r).await?;
                 let pos = [read_f64(&mut r)?, read_f64(&mut r)?, read_f64(&mut r)?];
                 let first = take_bytes(&mut r, 1)?[0]; // LpVec3: 0 alone, else 6 bytes, plus a varint scale if bit 2
                 if first != 0 {
@@ -891,9 +947,20 @@ pub async fn play(
                 }
                 let a = take_bytes(&mut r, 3)?;
                 let (pitch, yaw, head_yaw) = (angle(a[0]), angle(a[1]), angle(a[2]));
-                let name = names.get(&uuid).cloned().unwrap_or_else(|| "Player".into());
                 tracked.insert(id, Tracked { uuid, pos, yaw, pitch, head_yaw });
-                if events.send(Event::AddPlayer { id, uuid, name, pos, yaw, pitch }).is_err() {
+                let event = match kind {
+                    PLAYER_ENTITY_TYPE => {
+                        let name = names.get(&uuid).cloned().unwrap_or_else(|| "Player".into());
+                        Event::AddPlayer { id, uuid, name, pos, yaw, pitch }
+                    }
+                    // A dropped item's stack comes next, in set_entity_data; it is added to Bedrock then.
+                    ITEM_ENTITY_TYPE => {
+                        items_waiting.insert(id, pos);
+                        continue;
+                    }
+                    _ => Event::AddEntity { id, kind, pos, yaw, pitch, head_yaw },
+                };
+                if events.send(event).is_err() {
                     return Ok(());
                 }
             }
@@ -945,6 +1012,7 @@ pub async fn play(
             (State::Game, 0x4e) => {
                 for _ in 0..read_varint(&mut r).await? {
                     let id = read_varint(&mut r).await?;
+                    items_waiting.remove(&id);
                     if let Some(t) = tracked.remove(&id)
                         && events.send(Event::RemoveEntity { id, uuid: t.uuid }).is_err()
                     {
@@ -1044,6 +1112,51 @@ pub async fn play(
                     eprintln!("Java: equipment of entity {id} only partly read: {e}");
                 }
                 if events.send(Event::Equipment { id, slots }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x65) => {
+                // set_entity_data: a waiting dropped item's stack (index 8) completes it.
+                let id = read_varint_sync(&mut r)?;
+                let Some(&pos) = items_waiting.get(&id) else { continue };
+                match entity_data_item(r) {
+                    Ok(Some(item)) => {
+                        items_waiting.remove(&id);
+                        if events.send(Event::AddItem { id, item, pos }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("Java: data of item entity {id} not read: {e}"),
+                }
+            }
+            (State::Game, 0x22 | 0x2b | 0x19 | 0x7f) => {
+                let event = match id {
+                    // entity_event: id (i32), event (3 = death animation).
+                    0x22 => {
+                        let target = i32::from_be_bytes(take_bytes(&mut r, 4)?.try_into().unwrap());
+                        (take_bytes(&mut r, 1)?[0] == 3 && tracked.contains_key(&target)).then_some(Event::Death(target))
+                    }
+                    // hurt_animation (id, yaw) and damage_event (id, then the damage source): vanilla clients flash
+                    // an entity red on damage_event; hurt_animation is the player's own.
+                    0x2b | 0x19 => {
+                        let target = read_varint_sync(&mut r)?;
+                        if target == own_id {
+                            Some(Event::Hurt(None))
+                        } else {
+                            tracked.contains_key(&target).then_some(Event::Hurt(Some(target)))
+                        }
+                    }
+                    // take_item_entity: item id, collector id, amount.
+                    _ => {
+                        let (item, collector) = (read_varint_sync(&mut r)?, read_varint_sync(&mut r)?);
+                        let collector = (collector != own_id).then_some(collector);
+                        tracked.contains_key(&item).then_some(Event::TakeItem { item, collector })
+                    }
+                };
+                if let Some(e) = event
+                    && events.send(e).is_err()
+                {
                     return Ok(());
                 }
             }
@@ -1164,6 +1277,39 @@ mod tests {
         assert!(read_nbt(&mut &nbt[..5]).is_err(), "truncated NBT is an error");
     }
 
+    /// Live check of survival digging the bridge's way: stand on the ground, START on the block east of the
+    /// feet, STOP 1.5 s later. Run with Horizon up; the console sets survival and the block (see docs).
+    #[tokio::test]
+    #[ignore]
+    async fn digs_in_survival() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let mut at = None;
+        while at.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for e in rx.try_iter() {
+                if let Event::Position { x, y, z, .. } = e {
+                    at = Some([x, y, z]);
+                }
+            }
+        }
+        let [x, y, z] = at.unwrap();
+        let block = [x.floor() as i32 + 1, y.floor() as i32, z.floor() as i32];
+        println!("standing at {x:.2} {y:.2} {z:.2}, digging {block:?}");
+        for tick in 0..230 {
+            let _ = cmd_tx.send(Command::Move { x, y, z, yaw: -90.0, pitch: 0.0, on_ground: true });
+            match tick {
+                80 => drop(cmd_tx.send(Command::Dig { status: 0, pos: block, face: 4 })),
+                110 => drop(cmd_tx.send(Command::Dig { status: DIG_FINISH, pos: block, face: 4 })),
+                _ => {}
+            }
+            let _ = cmd_tx.send(Command::TickEnd);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        session.abort();
+    }
+
     #[test]
     fn reads_items() {
         assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
@@ -1267,6 +1413,9 @@ mod tests {
                 Event::Health { health, food, saturation } => println!("health {health} food {food} saturation {saturation}"),
                 Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
                 Event::Cursor(item) => println!("cursor {item:?}"),
+                Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
+                Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
+                Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } => {}
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;

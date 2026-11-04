@@ -19,20 +19,21 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Movement and game mode | Bedrock movement moves the Java player (one position per tick, ground state from Bedrock's collision flag), new terrain loads as you walk, and Horizon's game mode is applied on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
 | Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
 | Other players | Java players appear on Bedrock (name tag, generated Steve-shaped skin), move, and disappear when they leave. What they hold and their armour are shown. | `src/bedrock.rs`, `src/java.rs` |
-| Blocks | Breaking and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
+| Blocks | Breaking (creative and survival, with tools) and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
+| Mobs and dropped items | Java entities with a Bedrock counterpart (149 types) appear, move, flash red when hurt and play their death; dropped items show and are picked up. | `src/bedrock.rs`, `src/java.rs`, `data/java_entities.txt` |
 | Items | The full item list, creative menu and data-driven block definitions (byte-identical to Mojang's server). The Horizon inventory (hotbar, main, armour, offhand) shows on Bedrock, and the selected hotbar slot is synced both ways. | `data/*.bin`, `tools/gen_item_data.py` |
 | Inventory actions | The inventory screen opens; taking from the creative menu, moving, splitting, swapping, binning and dropping items reach Horizon (creative: slot edits; survival: Java inventory clicks). Attacking players works with Horizon's anticheat. | `src/bedrock/inventory.rs` |
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 34 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 36 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
 These are shortcuts that are deliberate for now. The ones inside the code are marked `shortcut:` (search for that).
 
 - **Login identity is not verified.** Anyone who can reach the bridge can join under any name. Keep it on a LAN or VPN until [ROADMAP](ROADMAP.md) item 1 is done.
-- **No mobs or dropped items** on Bedrock yet, only players. Other players' real skins and animations (swing, sneak) aren't shown.
+- **Mobs show their type only**: no variants (sheep colours, baby mobs), names or held items yet, and their hitbox size is the client's default. Other players' real skins and animations (swing, sneak) aren't shown. No crack animation while breaking a block.
 - **No crafting yet.** The bridge sends Bedrock no recipes, so the crafting grid and crafting table don't work; requests that use them are refused. Items show no damage, names or enchantment glint, and potions or enchanted books from the creative menu lose their effect on Horizon.
 - **Every biome is plains** (grass and leaf colours are off), and block entities (chests, signs) have no data. No biome definitions are sent (the client uses its built-in ones).
 - Relative teleports from Horizon are treated as absolute.

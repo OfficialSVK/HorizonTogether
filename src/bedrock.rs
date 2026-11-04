@@ -46,6 +46,11 @@ const VOXEL_SHAPES: u32 = 337;
 const PLAYER_AUTH_INPUT: u32 = 144;
 const UPDATE_BLOCK: u32 = 21;
 const LEVEL_EVENT: u32 = 25;
+const ADD_ACTOR: u32 = 13;
+const ADD_ITEM_ACTOR: u32 = 15;
+const TAKE_ITEM_ACTOR: u32 = 17;
+const MOVE_ACTOR_ABSOLUTE: u32 = 18;
+const ACTOR_EVENT: u32 = 27;
 const MOB_EQUIPMENT: u32 = 31;
 const MOB_ARMOR_EQUIPMENT: u32 = 32;
 const PLAYER_HOTBAR: u32 = 48;
@@ -65,6 +70,7 @@ const INVENTORY_TRANSACTION: u32 = 30;
 /// PlayerAuthInput flags that add optional sections after the fixed fields.
 const PERFORM_ITEM_INTERACTION: u128 = 1 << 34;
 const PERFORM_BLOCK_ACTIONS: u128 = 1 << 35;
+const PERFORM_ITEM_STACK_REQUEST: u128 = 1 << 36;
 /// PlayerActionType values used in PlayerAuthInput block actions.
 const START_DESTROY_BLOCK: i32 = 0;
 const ABORT_DESTROY_BLOCK: i32 = 1;
@@ -123,6 +129,10 @@ pub struct Session {
     last_click: Option<([i32; 3], u32, std::time::Instant)>,
     /// What other players hold and wear, by Java entity id and Java equipment slot (0-5).
     equipment: std::collections::HashMap<i32, [Option<crate::java::Item>; 6]>,
+    /// Last input flags logged (HORIZON_DEBUG_INPUT).
+    debug_flags: u128,
+    /// Java entities shown on Bedrock, and as what.
+    shown: std::collections::HashMap<i32, Shown>,
     /// The inventory screen's cursor, and the creative menu's output slot (the item just picked from it).
     cursor: Option<crate::java::Item>,
     created: Option<crate::java::Item>,
@@ -152,6 +162,8 @@ impl Default for Session {
             net_id: 0,
             last_click: None,
             equipment: Default::default(),
+            debug_flags: 0,
+            shown: Default::default(),
             cursor: None,
             created: None,
         }
@@ -347,6 +359,11 @@ impl Session {
                     // The input flags follow pitch, yaw, position, move vector and head yaw.
                     let mut rest = packet.get(32..).ok_or("short PlayerAuthInput")?;
                     let flags = read_input_flags(&mut rest)?;
+                    if std::env::var_os("HORIZON_DEBUG_INPUT").is_some() && flags != self.debug_flags {
+                        self.debug_flags = flags;
+                        let ids: Vec<u32> = (0..128).filter(|b| flags & 1 << b != 0).collect();
+                        println!("DEBUG input flags {ids:?} y {y:.3} (last sent {:.3})", self.pos[1]);
+                    }
                     if [x, y, z] != self.pos || [pitch, yaw] != self.rot {
                         let chunk = |p: [f32; 3]| (p[0].floor() as i32 >> 4, p[2].floor() as i32 >> 4);
                         let new_chunk = chunk([x, y, z]) != chunk(self.pos);
@@ -361,15 +378,23 @@ impl Session {
                             out.push(self.batch(&[self.publisher()])); // keep accepting Horizon's chunks around us
                         }
                     }
-                    if flags & (PERFORM_ITEM_INTERACTION | PERFORM_BLOCK_ACTIONS) != 0 {
+                    if flags & (PERFORM_ITEM_INTERACTION | PERFORM_ITEM_STACK_REQUEST | PERFORM_BLOCK_ACTIONS) != 0 {
+                        let raw = rest;
                         match read_auth_input_extras(&mut rest) {
-                            Ok((item_use, actions)) => {
+                            Ok((item_use, request, actions)) => {
                                 if let Some(u) = item_use {
                                     self.item_use(u, "PlayerAuthInput");
                                 }
+                                if let Some(req) = request {
+                                    let response = self.stack_requests(vec![req]);
+                                    out.push(self.batch(&[response]));
+                                }
                                 actions.into_iter().for_each(|(a, pos, face)| self.block_action(a, pos, face));
                             }
-                            Err(e) => eprintln!("Bedrock: can't read PlayerAuthInput item use / block actions: {e}"),
+                            Err(e) => {
+                                let ids: Vec<u32> = (0..128).filter(|b| flags & 1 << b != 0).collect();
+                                eprintln!("Bedrock: can't read PlayerAuthInput item use / block actions ({e}); flags {ids:?}: {raw:02x?}");
+                            }
                         }
                     }
                     self.to_java.push(crate::java::Command::TickEnd);
@@ -526,19 +551,71 @@ impl Session {
                     packet_bytes(PLAYER_LIST, &player_list_add(&uuid, entity_id(id), &name)),
                     packet_bytes(ADD_PLAYER, &add_player(&uuid, entity_id(id), &name, pos, yaw, pitch)),
                 ];
+                self.shown.insert(id, Shown::Player);
                 if self.spawned { packets.extend(add) } else { self.pending.extend(add) }
             }
-            crate::java::Event::MoveEntity { id, pos, yaw, pitch, head_yaw } if self.spawned => {
-                packets.push(move_entity(entity_id(id), pos, pitch, yaw, head_yaw));
+            crate::java::Event::AddEntity { id, kind, pos, yaw, pitch, head_yaw } => {
+                let Some(identifier) = crate::world::bedrock_entity(kind) else { return Vec::new() };
+                self.shown.insert(id, Shown::Actor);
+                let p = packet_bytes(ADD_ACTOR, &add_actor(entity_id(id), identifier, pos, yaw, pitch, head_yaw));
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
+            crate::java::Event::AddItem { id, item, pos } => {
+                println!("Bedrock: showing dropped item {id} ({item:?}) at {pos:.1?}{}", if self.spawned { "" } else { " (with the spawn)" });
+                self.shown.insert(id, Shown::Actor);
+                let rid = entity_id(id);
+                let mut w = W::default();
+                w.varint64(rid as i64).varuint64(rid);
+                write_stack(&mut w, Some(item), None);
+                w.f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32).f32(0.0).f32(0.0).f32(0.0); // position, velocity
+                // Metadata as for mobs, with an item's box: without a scale the item isn't drawn.
+                w.varuint(4);
+                w.meta(0, 7).varint64(1 << 48 | 1 << 49); // collision, gravity
+                w.meta(38, 3).f32(1.0).meta(53, 3).f32(0.25).meta(54, 3).f32(0.25); // scale, box width, height
+                w.bool(false); // not from fishing
+                let p = packet_bytes(ADD_ITEM_ACTOR, &w.0);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            crate::java::Event::MoveEntity { id, pos, yaw, pitch, head_yaw } if self.spawned => match self.shown.get(&id) {
+                Some(Shown::Player) => packets.push(move_entity(entity_id(id), pos, pitch, yaw, head_yaw)),
+                Some(Shown::Actor) => {
+                    // MoveActorAbsolute: runtime id, flags, position (feet), pitch, yaw, head yaw as 1/256 turns.
+                    let turn = |a: f32| (a.rem_euclid(360.0) / 360.0 * 256.0) as u8;
+                    let mut w = W::default();
+                    w.varuint64(entity_id(id)).u8(0).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
+                    w.u8(turn(pitch)).u8(turn(yaw)).u8(turn(head_yaw));
+                    packets.push(packet_bytes(MOVE_ACTOR_ABSOLUTE, &w.0));
+                }
+                None => {}
+            },
             crate::java::Event::MoveEntity { .. } => {}
             crate::java::Event::RemoveEntity { id, uuid } => {
                 self.equipment.remove(&id);
+                let Some(shown) = self.shown.remove(&id) else { return Vec::new() };
                 packets.push(packet_bytes(REMOVE_ACTOR, &W::default().varint64(entity_id(id) as i64).0));
-                let mut list = W::default();
-                list.varuint(1).varuint(0).u8(1).bytes(&bedrock_uuid(&uuid)); // one entry: remove
-                packets.push(packet_bytes(PLAYER_LIST, &list.0));
+                if shown == Shown::Player {
+                    let mut list = W::default();
+                    list.varuint(1).varuint(0).u8(1).bytes(&bedrock_uuid(&uuid)); // one entry: remove
+                    packets.push(packet_bytes(PLAYER_LIST, &list.0));
+                }
             }
+            // ActorEvent: runtime id, event (2 hurt, 3 death), data, no position.
+            crate::java::Event::Hurt(id) if self.spawned => {
+                let rid = match id {
+                    None => 1,
+                    Some(id) if self.shown.contains_key(&id) => entity_id(id),
+                    Some(_) => return Vec::new(),
+                };
+                packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(rid).u8(2).varint(0).bool(false).0));
+            }
+            crate::java::Event::Death(id) if self.spawned && self.shown.contains_key(&id) => {
+                packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(entity_id(id)).u8(3).varint(0).bool(false).0));
+            }
+            crate::java::Event::TakeItem { item, collector } if self.spawned && self.shown.contains_key(&item) => {
+                let taker = collector.map_or(1, entity_id); // 1: our own player
+                packets.push(packet_bytes(TAKE_ITEM_ACTOR, &W::default().varuint64(entity_id(item)).varuint64(taker).0));
+            }
+            crate::java::Event::Hurt(_) | crate::java::Event::Death(_) | crate::java::Event::TakeItem { .. } => {}
             crate::java::Event::Rain(level) => {
                 let p = weather(level, 3001, 3003);
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -584,6 +661,7 @@ impl Session {
                 ]));
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
+            crate::java::Event::Equipment { id, .. } if !self.shown.contains_key(&id) => {}
             crate::java::Event::Equipment { id, slots } => {
                 let worn = self.equipment.entry(id).or_default();
                 let mut hands = Vec::new();
@@ -701,12 +779,13 @@ impl Session {
         }
     }
 
-    /// Items dropped from the held hotbar slot (Q): Java's drop-one (player_action 3) per item, or drop-stack (4).
+    /// Items dropped from the held hotbar slot (Q): Java's drop-one per item, or drop-stack.
     fn drop_held(&mut self, n: u32) {
+        use crate::java::{DROP_ALL, DROP_ONE};
         let held = self.held as usize;
         let Some(item) = self.inventory[held] else { return };
         let all = n >= item.count as u32;
-        let (status, times) = if all { (4, 1) } else { (3, n) };
+        let (status, times) = if all { (DROP_ALL, 1) } else { (DROP_ONE, n) };
         for _ in 0..times {
             self.to_java.push(crate::java::Command::Dig { status, pos: [0, 0, 0], face: 0 });
         }
@@ -716,28 +795,36 @@ impl Session {
     /// A Bedrock block action (server-authoritative breaking) as Java digging. Java creative breaks on "start";
     /// survival needs "start", then "finish" once the block is predicted broken.
     fn block_action(&mut self, action: i32, pos: [i32; 3], face: i32) {
+        use crate::java::{DIG_ABORT, DIG_FINISH, DIG_START};
         let status = match action {
+            // "Continue" repeats every tick while the button is held: only a new block restarts Java's dig timer.
+            START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK if self.breaking == Some(pos) => return,
             START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK => {
                 self.breaking = Some(pos);
-                0
+                DIG_START
             }
-            ABORT_DESTROY_BLOCK => {
+            ABORT_DESTROY_BLOCK => match self.breaking.take() {
+                Some(started) => return self.dig(action, DIG_ABORT, started, face),
+                None => return, // nothing being dug (the client aborts after a finished break too)
+            },
+            // Survival break of a block never started (instant-break blocks): Java breaks those on "start".
+            PREDICT_DESTROY_BLOCK if self.game_mode != 1 && self.breaking != Some(pos) => {
                 self.breaking = None;
-                1
+                DIG_START
             }
             CREATIVE_DESTROY_BLOCK | PREDICT_DESTROY_BLOCK if self.game_mode == 1 => {
                 if self.breaking.take() == Some(pos) {
                     return; // already broken by "start"
                 }
-                0
+                DIG_START
             }
             PREDICT_DESTROY_BLOCK => {
                 self.breaking = None;
-                2
+                DIG_FINISH
             }
             // PlayerAction's stop has no position: finish the block we started on.
             STOP_DESTROY_BLOCK if self.game_mode != 1 => match self.breaking.take() {
-                Some(started) => return self.dig(action, 2, started, face),
+                Some(started) => return self.dig(action, DIG_FINISH, started, face),
                 None => return,
             },
             _ => return, // crack progress, stop
@@ -893,6 +980,28 @@ fn player_metadata() -> Vec<u8> {
     w.meta(53, FLOAT).f32(0.6); // bounding box width
     w.meta(54, FLOAT).f32(1.8); // bounding box height
     w.varuint(0).varuint(0).varuint64(0); // no synced int/float properties, input tick
+    w.0
+}
+
+/// How a Java entity is shown on Bedrock.
+#[derive(Clone, Copy, PartialEq)]
+enum Shown {
+    Player,
+    Actor,
+}
+
+/// AddActor for a mob, projectile or vehicle at a Java feet position.
+fn add_actor(rid: u64, identifier: &str, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32) -> Vec<u8> {
+    let mut w = W::default();
+    w.varint64(rid as i64).varuint64(rid).string(identifier);
+    w.f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32).f32(0.0).f32(0.0).f32(0.0); // position, velocity
+    w.f32(pitch).f32(yaw).f32(head_yaw).f32(yaw); // pitch, yaw, head yaw, body yaw
+    w.varuint(0); // no attributes
+    // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1
+    w.varuint(2);
+    w.meta(0, 7).varint64(1 << 19 | 1 << 35 | 1 << 48 | 1 << 49);
+    w.meta(38, 3).f32(1.0);
+    w.varuint(0).varuint(0).varuint(0).bool(false); // no synced properties, no links, not riding a block
     w.0
 }
 
@@ -1165,9 +1274,9 @@ fn read_input_flags(r: &mut &[u8]) -> Result<u128, String> {
     Ok(flags)
 }
 
-/// The rest of PlayerAuthInput after the input flags, up to this tick's item use and block actions. Since 26.x
-/// these are optionals (a presence bool each), as in gophertunnel's PlayerAuthInput.
-fn read_auth_input_extras(r: &mut &[u8]) -> Result<(Option<ItemUse>, BlockActions), String> {
+/// The rest of PlayerAuthInput after the input flags: this tick's item use, item stack request (a tool's wear
+/// while mining) and block actions. Since 26.x these are optionals (a presence bool each), as in gophertunnel.
+fn read_auth_input_extras(r: &mut &[u8]) -> Result<(Option<ItemUse>, Option<inventory::Request>, BlockActions), String> {
     for _ in 0..3 {
         read_uvarint(r)?; // input mode, play mode, interaction model
     }
@@ -1181,12 +1290,16 @@ fn read_auth_input_extras(r: &mut &[u8]) -> Result<(Option<ItemUse>, BlockAction
     } else {
         None
     };
+    let mut request = None;
     if read_bool(r)? {
-        // shortcut: item stack requests aren't decoded yet (inventory moves); the block actions after one are lost.
-        return Ok((item_use, Vec::new()));
+        let (req, complete) = inventory::read_request(r)?;
+        request = Some(req);
+        if !complete {
+            return Ok((item_use, request, Vec::new())); // the block actions after it can't be found
+        }
     }
     let actions = if read_bool(r)? { read_block_actions(r)? } else { Vec::new() };
-    Ok((item_use, actions))
+    Ok((item_use, request, actions))
 }
 
 fn read_bool(r: &mut &[u8]) -> Result<bool, String> {
@@ -1404,11 +1517,15 @@ mod tests {
         // face 1, hotbar slot, hand, empty item, player position, click position, target block, prediction, cooldown
         p.extend([1, 0, 0, 0, 4, 1, 0, 0, 0, 1, 0, 0]);
         p.extend([0; 8 + 12 + 12 + 1 + 2]);
-        p.push(0); // no item stack request
+        // item stack request present (a tool's wear while mining): id -5 (zigzag 9), one action: variant 9 = mine
+        // block (type 11), legacy byte, hotbar slot, predicted durability, stack net id (i32); no filter strings,
+        // cause
+        p.extend([1, 9, 1, 9, 11, 0, 4, 7, 0, 0, 0, 0, 0, 0, 0, 0]);
         // block actions present: predict destroy (26) at (-2, 67, 25), face 1
         p.extend([1, 1, 52, 3, 0x86, 0x01, 50, 2]);
-        let (item_use, actions) = read_auth_input_extras(&mut &p[..]).unwrap();
-        assert_eq!(actions, [(PREDICT_DESTROY_BLOCK, [-2, 67, 25], 1)]);
+        let (item_use, request, actions) = read_auth_input_extras(&mut &p[..]).unwrap();
+        assert_eq!(actions, [(PREDICT_DESTROY_BLOCK, [-2, 67, 25], 1)], "the block actions after a stack request");
+        assert_eq!(request.map(|r| r.id), Some(-5));
         let u = item_use.expect("item use");
         assert_eq!((u.action, u.trigger, u.pos, u.face), (2, 1, [0, 0, 0], 1));
     }
@@ -1445,9 +1562,42 @@ mod tests {
     }
 
     #[test]
+    fn mobs_and_items() {
+        use crate::java::{Event, Item};
+        let mut s = Session { spawned: true, ..Default::default() };
+        let ids = |batches: Vec<Vec<u8>>| -> Vec<u32> {
+            let mut r = &batches.concat()[..];
+            let mut out = Vec::new();
+            while !r.is_empty() {
+                let n = read_uvarint(&mut r).unwrap() as usize;
+                out.push(read_uvarint(&mut &r[..n]).unwrap());
+                r = &r[n..];
+            }
+            out
+        };
+        // A zombie (Java type 154): AddActor with its Bedrock identifier; moves are MoveActorAbsolute.
+        let add = s.on_java(Event::AddEntity { id: 9, kind: 154, pos: [1.0, 64.0, 2.0], yaw: 90.0, pitch: 0.0, head_yaw: 90.0 });
+        assert_eq!(ids(add.clone()), [ADD_ACTOR]);
+        assert!(add[0].windows(16).any(|w| w == b"minecraft:zombie"));
+        let moved = s.on_java(Event::MoveEntity { id: 9, pos: [1.5, 64.0, 2.0], yaw: 180.0, pitch: 0.0, head_yaw: 180.0 });
+        assert_eq!(ids(moved.clone()), [MOVE_ACTOR_ABSOLUTE]);
+        assert_eq!(moved[0][moved[0].len() - 3..], [0, 128, 128], "pitch, yaw and head yaw in 1/256 turns");
+        assert_eq!(ids(s.on_java(Event::Hurt(Some(9)))), [ACTOR_EVENT]);
+        assert_eq!(ids(s.on_java(Event::RemoveEntity { id: 9, uuid: [0; 16] })), [REMOVE_ACTOR], "no player list entry");
+        // An entity Bedrock has no counterpart for (Java type 85, marker) is skipped, and so are its moves.
+        assert!(s.on_java(Event::AddEntity { id: 10, kind: 85, pos: [0.0; 3], yaw: 0.0, pitch: 0.0, head_yaw: 0.0 }).is_empty());
+        assert!(s.on_java(Event::MoveEntity { id: 10, pos: [0.0; 3], yaw: 0.0, pitch: 0.0, head_yaw: 0.0 }).is_empty());
+        // A dropped item: AddItemActor, then picked up by us.
+        let item = s.on_java(Event::AddItem { id: 11, item: Item { id: 1, count: 3 }, pos: [0.0, 65.0, 0.0] });
+        assert_eq!(ids(item), [ADD_ITEM_ACTOR]);
+        assert_eq!(ids(s.on_java(Event::TakeItem { item: 11, collector: None })), [TAKE_ITEM_ACTOR]);
+    }
+
+    #[test]
     fn other_players_equipment() {
         use crate::java::{Event, Item};
         let mut s = Session { spawned: true, ..Default::default() };
+        s.shown.insert(5, Shown::Player);
         let stone = Some(Item { id: 1, count: 1 });
         let held = s.on_java(Event::Equipment { id: 5, slots: vec![(0, stone)] });
         // MobEquipment for runtime id 7 (Java 5 + 2): the stack without a net id, then slots and window 0.
@@ -1478,6 +1628,27 @@ mod tests {
         want.push(10);
         want.extend([0; 10]);
         assert_eq!(p, want);
+    }
+
+    #[test]
+    fn survival_break_is_one_start_and_one_finish() {
+        let mut s = Session { game_mode: 0, ..Default::default() };
+        let digs = |s: &mut Session| -> Vec<i32> {
+            s.take_to_java().into_iter().map(|c| match c { crate::java::Command::Dig { status, .. } => status, _ => -1 }).collect()
+        };
+        // From a real 26.60 client in survival: start, continue (every tick), predict destroy, then abort.
+        let pos = [195, 68, 48];
+        for a in [START_DESTROY_BLOCK, CONTINUE_DESTROY_BLOCK, CONTINUE_DESTROY_BLOCK, PREDICT_DESTROY_BLOCK, ABORT_DESTROY_BLOCK] {
+            s.block_action(a, pos, 1);
+        }
+        use crate::java::{DIG_ABORT, DIG_FINISH, DIG_START};
+        assert_eq!(digs(&mut s), [DIG_START, DIG_FINISH], "start once, finish once; no restart, no abort after the finish");
+        // Giving up mid-dig aborts; an instant-break block (no start) is a single start.
+        s.block_action(START_DESTROY_BLOCK, pos, 1);
+        s.block_action(ABORT_DESTROY_BLOCK, pos, 1);
+        s.block_action(PREDICT_DESTROY_BLOCK, [1, 2, 3], 1);
+        assert_eq!(digs(&mut s), [DIG_START, DIG_ABORT, DIG_START]);
+        assert_eq!((DIG_ABORT, DIG_FINISH), (2, 3), "26.3 numbering: 1 is change destroy direction");
     }
 
     #[test]

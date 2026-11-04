@@ -88,6 +88,14 @@ pub fn creative_java(net_id: u32) -> Option<i32> {
     (id >= 0).then_some(id)
 }
 
+/// One line per Java entity type id: its Bedrock identifier, empty when Bedrock has none (tools/gen_item_data.py).
+static JAVA_ENTITIES: &str = include_str!("../data/java_entities.txt");
+
+/// The Bedrock entity identifier for a Java entity type, if Bedrock has one.
+pub fn bedrock_entity(kind: i32) -> Option<&'static str> {
+    JAVA_ENTITIES.lines().nth(usize::try_from(kind).ok()?).filter(|s| !s.is_empty())
+}
+
 /// Converts the section data of a Java 26.3 chunk packet (24 overworld sections, y = -64..320) into a Bedrock
 /// LevelChunk payload. Returns (sub-chunk count, payload).
 /// shortcut: every biome becomes plains; real biomes need the Java biome registry mapped to Bedrock ids.
