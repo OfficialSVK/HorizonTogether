@@ -199,6 +199,10 @@ pub enum Command {
     Chat(String),
     /// A command, without the leading `/`.
     Run(String),
+    /// player_action on a block: 0 start digging (instant in creative), 1 abort, 2 finish. Face 0-5 (down, up, N, S, W, E).
+    Dig { status: i32, pos: [i32; 3], face: u8 },
+    /// Right-click on a block face with the main hand; cursor is the hit point within the block (0..1).
+    UseOn { pos: [i32; 3], face: u8, cursor: [f32; 3] },
 }
 
 /// What Horizon tells the bridge about the world, for the Bedrock side to translate.
@@ -211,6 +215,142 @@ pub enum Event {
     GameMode(u8),
     /// A chat line: `from` is the sender for player chat, `None` for system messages; overlay = action bar.
     Chat { from: Option<String>, text: String, overlay: bool },
+    /// Another player appeared: Java entity id, profile UUID (big-endian bytes), name, feet position, rotation.
+    AddPlayer { id: i32, uuid: [u8; 16], name: String, pos: [f64; 3], yaw: f32, pitch: f32 },
+    /// A tracked entity's new absolute position and rotation.
+    MoveEntity { id: i32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
+    /// A tracked entity is gone.
+    RemoveEntity { id: i32, uuid: [u8; 16] },
+    /// A block changed to a Java block state.
+    Block { pos: [i32; 3], state: u32 },
+}
+
+/// Java's packed block position: x and z 26 bits, y 12 bits.
+fn block_pos(p: [i32; 3]) -> [u8; 8] {
+    let [x, y, z] = p.map(|v| v as i64);
+    ((x & 0x3FF_FFFF) << 38 | (z & 0x3FF_FFFF) << 12 | (y & 0xFFF)).to_be_bytes()
+}
+
+fn read_block_pos(r: &mut &[u8]) -> io::Result<[i32; 3]> {
+    let v = i64::from_be_bytes(take_bytes(r, 8)?.try_into().unwrap());
+    Ok([(v >> 38) as i32, (v << 52 >> 52) as i32, (v << 26 >> 38) as i32])
+}
+
+fn read_varlong(r: &mut &[u8]) -> io::Result<i64> {
+    let mut v = 0u64;
+    for i in 0..10 {
+        let b = take_bytes(r, 1)?[0];
+        v |= ((b & 0x7f) as u64) << (7 * i);
+        if b & 0x80 == 0 {
+            return Ok(v as i64);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, "varlong too long"))
+}
+
+/// section_blocks_update: section position (x, z 22 bits, y 20 bits), then varlongs `state << 12 | x << 8 | z << 4 | y`.
+fn section_blocks(mut r: &[u8]) -> io::Result<Vec<([i32; 3], u32)>> {
+    let s = i64::from_be_bytes(take_bytes(&mut r, 8)?.try_into().unwrap());
+    let base = [(s >> 42) as i32 * 16, (s << 44 >> 44) as i32 * 16, (s << 22 >> 42) as i32 * 16];
+    let n = read_varlong(&mut r)?;
+    (0..n)
+        .map(|_| {
+            let v = read_varlong(&mut r)?;
+            let (x, z, y) = ((v >> 8 & 15) as i32, (v >> 4 & 15) as i32, (v & 15) as i32);
+            Ok(([base[0] + x, base[1] + y, base[2] + z], (v >> 12) as u32))
+        })
+        .collect()
+}
+
+/// minecraft:player in the entity_type registry (Java 26.3, from the data generator's registries report).
+const PLAYER_ENTITY_TYPE: i32 = 159;
+
+/// Another player Horizon showed us: kept to turn relative moves into absolute ones.
+struct Tracked {
+    uuid: [u8; 16],
+    pos: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    head_yaw: f32,
+}
+
+async fn read_str(r: &mut &[u8]) -> io::Result<String> {
+    let n = read_varint(r).await?.max(0) as usize;
+    Ok(String::from_utf8_lossy(take_bytes(r, n)?).into_owned())
+}
+
+fn read_f64(r: &mut &[u8]) -> io::Result<f64> {
+    Ok(f64::from_be_bytes(take_bytes(r, 8)?.try_into().unwrap()))
+}
+
+fn read_f32(r: &mut &[u8]) -> io::Result<f32> {
+    Ok(f32::from_be_bytes(take_bytes(r, 4)?.try_into().unwrap()))
+}
+
+fn angle(b: u8) -> f32 {
+    b as i8 as f32 * 360.0 / 256.0
+}
+
+/// player_info_update: an 8-bit action set, then per entry the UUID and each listed action's fields in order
+/// (add player, initialize chat, game mode, listed, latency, display name, list order, hat). Returns UUID -> name.
+async fn player_info_names(mut r: &[u8]) -> io::Result<Vec<([u8; 16], String)>> {
+    let actions = take_bytes(&mut r, 1)?[0];
+    let mut names = Vec::new();
+    for _ in 0..read_varint(&mut r).await? {
+        let uuid: [u8; 16] = take_bytes(&mut r, 16)?.try_into().unwrap();
+        if actions & 1 != 0 {
+            names.push((uuid, read_str(&mut r).await?));
+            for _ in 0..read_varint(&mut r).await? {
+                read_str(&mut r).await?; // property name
+                read_str(&mut r).await?; // value
+                if take_bytes(&mut r, 1)?[0] != 0 {
+                    read_str(&mut r).await?; // signature
+                }
+            }
+        }
+        if actions & 2 != 0 && take_bytes(&mut r, 1)?[0] != 0 {
+            take_bytes(&mut r, 24)?; // chat session id, key expiry
+            for _ in 0..2 {
+                let n = read_varint(&mut r).await?.max(0) as usize; // public key, key signature
+                take_bytes(&mut r, n)?;
+            }
+        }
+        if actions & 4 != 0 {
+            read_varint(&mut r).await?;
+        }
+        if actions & 8 != 0 {
+            take_bytes(&mut r, 1)?;
+        }
+        if actions & 16 != 0 {
+            read_varint(&mut r).await?;
+        }
+        if actions & 32 != 0 && take_bytes(&mut r, 1)?[0] != 0 {
+            read_nbt(&mut r)?;
+        }
+        if actions & 64 != 0 {
+            read_varint(&mut r).await?;
+        }
+        if actions & 128 != 0 {
+            take_bytes(&mut r, 1)?;
+        }
+    }
+    Ok(names)
+}
+
+/// Sum of a 26.x relative move: properties (bit 0 on ground, the rest a step count), then one delta or
+/// `steps` of [ticks, delta]; each delta is three i16 in 1/4096 blocks. Returns the delta and the rest.
+async fn read_delta(mut r: &[u8]) -> io::Result<([f64; 3], &[u8])> {
+    let steps = read_varint(&mut r).await? as u32 >> 1; // 0: one plain delta; n: n steps of [ticks, delta]
+    let mut d = [0.0; 3];
+    for _ in 0..steps.max(1) {
+        if steps > 0 {
+            read_varint(&mut r).await?; // ticks
+        }
+        for axis in &mut d {
+            *axis += i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap()) as f64 / 4096.0;
+        }
+    }
+    Ok((d, r))
 }
 
 /// Just enough of an NBT tree to flatten text components.
@@ -293,6 +433,12 @@ fn component_text(c: &Nbt) -> String {
                         "chat.type.emote" => "* %s %s",
                         "multiplayer.player.joined" => "%s joined the game",
                         "multiplayer.player.left" => "%s left the game",
+                        "command.unknown.command" => "Unknown or incomplete command, see below for error",
+                        "command.unknown.argument" => "Incorrect argument for command",
+                        "command.context.here" => "<--[HERE]",
+                        "commands.time.set" => "Set the time to %s",
+                        "commands.gamemode.success.self" => "Set own game mode to %s",
+                        "commands.gamemode.success.other" => "Set %s's game mode to %s",
                         // shortcut: other keys show their arguments only; full text needs the language files.
                         _ => return args.join(" ") + &extra_text(f),
                     };
@@ -412,6 +558,9 @@ pub async fn play(
     }
     let mut state = State::Login;
     let (mut loaded, mut chunks) = (false, 0u32);
+    let mut names: std::collections::HashMap<[u8; 16], String> = Default::default();
+    let mut tracked: std::collections::HashMap<i32, Tracked> = Default::default();
+    let mut sequence = 0i32;
     loop {
         let (id, body) = tokio::select! {
             packet = packets.recv() => packet.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))??,
@@ -443,6 +592,28 @@ pub async fn play(
                         let mut m = Vec::new();
                         write_string(&mut m, &cmd);
                         c.send(0x07, &m).await?; // chat_command (unsigned)
+                    }
+                    // Block interactions carry a sequence number the server acknowledges (block_changed_ack).
+                    Command::Dig { status, pos, face } => {
+                        sequence += 1;
+                        let mut m = Vec::new();
+                        write_varint(&mut m, status);
+                        m.extend(block_pos(pos));
+                        m.push(face);
+                        write_varint(&mut m, sequence);
+                        c.send(0x29, &m).await?; // player_action
+                    }
+                    Command::UseOn { pos, face, cursor } => {
+                        sequence += 1;
+                        let mut m = vec![0]; // main hand
+                        m.extend(block_pos(pos));
+                        write_varint(&mut m, face as i32);
+                        for v in cursor {
+                            m.extend(v.to_be_bytes());
+                        }
+                        m.extend([0, 0]); // not inside the block, not the world border
+                        write_varint(&mut m, sequence);
+                        c.send(0x42, &m).await?; // use_item_on
                     }
                 }
                 continue;
@@ -511,6 +682,99 @@ pub async fn play(
                 };
                 if events.send(chat).is_err() {
                     return Ok(());
+                }
+            }
+            (State::Game, 0x47) => names.extend(player_info_names(&body).await?),
+            (State::Game, 0x01) => {
+                // add_entity: id, uuid, type, position (3 f64), velocity (LpVec3), pitch, yaw, head yaw (angle bytes).
+                let id = read_varint(&mut r).await?;
+                let uuid: [u8; 16] = take_bytes(&mut r, 16)?.try_into().unwrap();
+                if read_varint(&mut r).await? != PLAYER_ENTITY_TYPE {
+                    continue; // shortcut: only players are shown on Bedrock so far; mobs and items come next
+                }
+                let pos = [read_f64(&mut r)?, read_f64(&mut r)?, read_f64(&mut r)?];
+                let first = take_bytes(&mut r, 1)?[0]; // LpVec3: 0 alone, else 6 bytes, plus a varint scale if bit 2
+                if first != 0 {
+                    take_bytes(&mut r, 5)?;
+                    if first & 4 != 0 {
+                        read_varint(&mut r).await?;
+                    }
+                }
+                let a = take_bytes(&mut r, 3)?;
+                let (pitch, yaw, head_yaw) = (angle(a[0]), angle(a[1]), angle(a[2]));
+                let name = names.get(&uuid).cloned().unwrap_or_else(|| "Player".into());
+                tracked.insert(id, Tracked { uuid, pos, yaw, pitch, head_yaw });
+                if events.send(Event::AddPlayer { id, uuid, name, pos, yaw, pitch }).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, packet @ (0x36 | 0x37 | 0x39 | 0x55 | 0x23 | 0x80)) => {
+                let entity = read_varint(&mut r).await?;
+                let Some(t) = tracked.get_mut(&entity) else { continue };
+                match packet {
+                    // move_entity_pos / move_entity_pos_rot: a relative move, then (pos_rot) yaw and pitch.
+                    0x36 | 0x37 => {
+                        let (d, mut rest) = read_delta(r).await?;
+                        for (p, dp) in t.pos.iter_mut().zip(d) {
+                            *p += dp;
+                        }
+                        if packet == 0x37 {
+                            let a = take_bytes(&mut rest, 2)?;
+                            (t.yaw, t.pitch) = (angle(a[0]), angle(a[1]));
+                        }
+                    }
+                    0x39 => {
+                        let a = take_bytes(&mut r, 2)?; // move_entity_rot: yaw, pitch
+                        (t.yaw, t.pitch) = (angle(a[0]), angle(a[1]));
+                    }
+                    0x55 => t.head_yaw = angle(take_bytes(&mut r, 1)?[0]), // rotate_head
+                    0x23 => {
+                        // entity_position_sync: stepped? [pos, tick]... : pos; then yaw, pitch (f32).
+                        if read_varint(&mut r).await? == 1 {
+                            for _ in 0..read_varint(&mut r).await? {
+                                t.pos = [read_f64(&mut r)?, read_f64(&mut r)?, read_f64(&mut r)?];
+                                read_varint(&mut r).await?;
+                            }
+                        } else {
+                            t.pos = [read_f64(&mut r)?, read_f64(&mut r)?, read_f64(&mut r)?];
+                        }
+                        (t.yaw, t.pitch) = (read_f32(&mut r)?, read_f32(&mut r)?);
+                    }
+                    _ => {
+                        // teleport_entity: position, velocity (3 f64 each), yaw, pitch.
+                        // shortcut: relative flags ignored; entity teleports are almost always absolute.
+                        t.pos = [read_f64(&mut r)?, read_f64(&mut r)?, read_f64(&mut r)?];
+                        take_bytes(&mut r, 24)?;
+                        (t.yaw, t.pitch) = (read_f32(&mut r)?, read_f32(&mut r)?);
+                    }
+                }
+                let moved = Event::MoveEntity { id: entity, pos: t.pos, yaw: t.yaw, pitch: t.pitch, head_yaw: t.head_yaw };
+                if events.send(moved).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x4e) => {
+                for _ in 0..read_varint(&mut r).await? {
+                    let id = read_varint(&mut r).await?;
+                    if let Some(t) = tracked.remove(&id)
+                        && events.send(Event::RemoveEntity { id, uuid: t.uuid }).is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            (State::Game, 0x08 | 0x56) => {
+                let blocks = if id == 0x08 {
+                    // block_update: position, block state
+                    let pos = read_block_pos(&mut r)?;
+                    vec![(pos, read_varint(&mut r).await? as u32)]
+                } else {
+                    section_blocks(&body)?
+                };
+                for (pos, state) in blocks {
+                    if events.send(Event::Block { pos, state }).is_err() {
+                        return Ok(());
+                    }
                 }
             }
             (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
@@ -604,6 +868,41 @@ mod tests {
     }
 
     #[test]
+    fn block_positions() {
+        for p in [[0, 0, 0], [-1, -64, 5], [29_999_999, 319, -30_000_000]] {
+            assert_eq!(read_block_pos(&mut &block_pos(p)[..]).unwrap(), p);
+        }
+        // Section (-1, 4, 2), one change: state 1 at local x=3, z=2, y=15.
+        let mut b = ((-1i64 << 42) | (2 << 20) | 4).to_be_bytes().to_vec();
+        b.push(1);
+        write_varint(&mut b, 1 << 12 | 3 << 8 | 2 << 4 | 15);
+        assert_eq!(section_blocks(&b).unwrap(), [([-13, 79, 34], 1)]);
+    }
+
+    #[tokio::test]
+    async fn relative_moves() {
+        let delta = |v: [i16; 3]| v.iter().flat_map(|a| a.to_be_bytes()).collect::<Vec<u8>>();
+        // plain: properties 0, one delta of (1, 0, -0.5) blocks, then whatever follows (yaw, pitch)
+        let plain = [&[0u8][..], &delta([4096, 0, -2048]), &[64, 0]].concat();
+        let (d, rest) = read_delta(&plain).await.unwrap();
+        assert_eq!((d, rest), ([1.0, 0.0, -0.5], &[64u8, 0][..]));
+        // stepped: 2 steps (properties 2<<1 | on-ground), each [ticks, delta]
+        let stepped = [&[5u8, 1][..], &delta([4096, 0, 0]), &[1], &delta([4096, 0, 0])].concat();
+        assert_eq!(read_delta(&stepped).await.unwrap().0, [2.0, 0.0, 0.0]);
+        assert!(read_delta(&[0, 1]).await.is_err(), "truncated move is an error");
+    }
+
+    #[tokio::test]
+    async fn player_info_walks_every_action() {
+        // actions: add player (1), game mode (4), listed (8); one entry
+        let mut b = vec![1 | 4 | 8, 1];
+        b.extend([7u8; 16]);
+        write_string(&mut b, "Alex");
+        b.extend([0, 1, 1]); // no properties, game mode 1, listed
+        assert_eq!(player_info_names(&b).await.unwrap(), vec![([7u8; 16], "Alex".to_string())]);
+    }
+
+    #[test]
     fn java_names() {
         assert_eq!(java_name("Sergiy22889917"), ".Sergiy22889917");
         assert_eq!(java_name("Cool Gamer"), ".Cool_Gamer");
@@ -635,6 +934,8 @@ mod tests {
             match e {
                 Event::GameMode(m) => println!("game mode {m}"),
                 Event::Chat { from, text, .. } => println!("chat from {from:?}: {text}"),
+                Event::AddPlayer { name, pos, .. } => println!("player {name} at {pos:?}"),
+                Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } => {}
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;

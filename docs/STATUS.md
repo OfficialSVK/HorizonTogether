@@ -1,6 +1,6 @@
 # Status
 
-*Last updated 2026-11-03.* Architecture and protocol notes are in [DESIGN.md](DESIGN.md). What's next is in [ROADMAP.md](ROADMAP.md).
+*Last updated 2026-11-04.* Architecture and protocol notes are in [DESIGN.md](DESIGN.md). What's next is in [ROADMAP.md](ROADMAP.md).
 
 ## What works
 
@@ -16,8 +16,12 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Spawn | StartGame, chunks and player state, then a delayed spawn status. The player **walks, flies and breaks blocks**. | `src/bedrock.rs` |
 | Horizon link | Each Bedrock player also joins Horizon as a Java 26.3 player named `.<gamertag>`: offline login, configuration, keep-alives, teleports and chunk acks. Java players see them; they leave Horizon when they leave Bedrock. | `src/java.rs`, `src/webrtc.rs` |
 | Horizon's world on Bedrock | Horizon's chunks are translated to Bedrock sub-chunks (Java block states mapped through Geyser's table), and the player spawns at Horizon's position. Verified: a real Horizon world renders correctly. | `src/world.rs`, `data/java_blocks.bin` |
+| Movement and game mode | Bedrock movement moves the Java player (one position per tick, ground state from Bedrock's collision flag), new terrain loads as you walk, and Horizon's game mode is applied on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
+| Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
+| Other players | Java players appear on Bedrock (name tag, plain generated skin), move, and disappear when they leave. | `src/bedrock.rs`, `src/java.rs` |
+| Blocks | Breaking on Bedrock breaks on Horizon (verified in creative), and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
 
-There are 14 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 25 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
@@ -46,4 +50,5 @@ Bedrock's error codewords mean little on their own. This is what each one meant 
 | Door / InitialConnection-142 | The answer was rejected: `a=identity` was missing. |
 | Kelp / InitialConnection-32 | Transport up, but the game layer timed out waiting for a reply. |
 | Boat / InitialConnection-148, Block / InitialConnection-90 | A packet the client couldn't decode or accept (wrong layout, partial biome list). |
+| Block / ClientDisconnection-90 after spawn | The client rejected one of our packets. The bridge logs the reason (`client rejected our packet N`): e.g. an invalid enum value, or a skin field that must be JSON. |
 | Stuck on "Loading… Create", floating, can only break blocks | The spawn status was sent too early. See the join sequence in DESIGN.md. |

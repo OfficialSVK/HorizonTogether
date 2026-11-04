@@ -11,6 +11,12 @@ const RESOURCE_PACK_STACK: u32 = 7;
 const RESOURCE_PACK_CLIENT_RESPONSE: u32 = 8;
 const TEXT: u32 = 9;
 const START_GAME: u32 = 11;
+const ADD_PLAYER: u32 = 12;
+const REMOVE_ACTOR: u32 = 14;
+const PLAYER_LIST: u32 = 63;
+const PACKET_VIOLATION_WARNING: u32 = 156;
+/// BuildPlatform "Unknown"; 0 is not a valid value and the client rejects the packet.
+const PLATFORM_UNKNOWN: i32 = -1;
 const COMMAND_REQUEST: u32 = 77;
 const MOVE_PLAYER: u32 = 19;
 const SET_ACTOR_DATA: u32 = 39;
@@ -36,6 +42,21 @@ const JIGSAW_STRUCTURE_DATA: u32 = 313;
 const VOXEL_SHAPES: u32 = 337;
 
 const PLAYER_AUTH_INPUT: u32 = 144;
+const UPDATE_BLOCK: u32 = 21;
+const INVENTORY_TRANSACTION: u32 = 30;
+/// PlayerAuthInput flags that add optional sections after the fixed fields.
+const PERFORM_ITEM_INTERACTION: u128 = 1 << 34;
+const PERFORM_BLOCK_ACTIONS: u128 = 1 << 35;
+const PERFORM_ITEM_STACK_REQUEST: u128 = 1 << 36;
+/// PlayerActionType values used in PlayerAuthInput block actions.
+const START_DESTROY_BLOCK: i32 = 0;
+const ABORT_DESTROY_BLOCK: i32 = 1;
+const STOP_DESTROY_BLOCK: i32 = 2;
+const CREATIVE_DESTROY_BLOCK: i32 = 13;
+/// PlayerAction: how the client reports digging when breaking isn't server-authoritative (as now).
+const PLAYER_ACTION: u32 = 36;
+const PREDICT_DESTROY_BLOCK: i32 = 26;
+const CONTINUE_DESTROY_BLOCK: i32 = 27;
 const SPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// PlayStatus values.
@@ -73,6 +94,8 @@ pub struct Session {
     logged: std::collections::HashSet<u32>,
     /// Set once a recorded join stream has been replayed (dev tool, see REPLAY_ENV).
     replay: Option<()>,
+    /// Block the player started digging (Horizon was sent "start digging" for it).
+    breaking: Option<[i32; 3]>,
 }
 
 impl Default for Session {
@@ -93,6 +116,7 @@ impl Default for Session {
             joined: None,
             logged: Default::default(),
             replay: None,
+            breaking: None,
         }
     }
 }
@@ -281,12 +305,13 @@ impl Session {
                 PLAYER_AUTH_INPUT if self.linked && self.spawn_status_sent => {
                     let f = |i: usize| packet.get(i..i + 4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).ok_or("short PlayerAuthInput");
                     let (pitch, yaw, x, y, z) = (f(0)?, f(4)?, f(8)?, f(12)? - 1.62, f(16)?);
+                    // The input flag set follows pitch, yaw, position, move vector and head yaw.
+                    let mut rest = packet.get(32..).ok_or("short PlayerAuthInput")?;
+                    let flags = read_uvarint128(&mut rest)?;
                     if [x, y, z] != self.pos || [pitch, yaw] != self.rot {
                         let chunk = |p: [f32; 3]| (p[0].floor() as i32 >> 4, p[2].floor() as i32 >> 4);
                         let new_chunk = chunk([x, y, z]) != chunk(self.pos);
-                        // Java's on_ground: Bedrock's VerticalCollision input flag (bit 50 of the varint flag set
-                        // after pitch, yaw, position, move vector and head yaw), while not moving up.
-                        let flags = read_uvarint128(&mut packet.get(32..).ok_or("short PlayerAuthInput")?)?;
+                        // Java's on_ground: Bedrock's VerticalCollision input flag, while not moving up.
                         let on_ground = flags & (1 << 50) != 0 && y <= self.pos[1];
                         self.pos = [x, y, z];
                         self.rot = [pitch, yaw];
@@ -297,8 +322,32 @@ impl Session {
                             out.push(self.batch(&[self.publisher()])); // keep accepting Horizon's chunks around us
                         }
                     }
+                    if flags & PERFORM_BLOCK_ACTIONS != 0 {
+                        match read_block_actions(&mut rest, flags) {
+                            Ok(actions) => actions.into_iter().for_each(|(a, pos, face)| self.block_action(a, pos, face)),
+                            Err(e) => eprintln!("Bedrock: can't read block actions: {e}"),
+                        }
+                    }
                     self.to_java.push(crate::java::Command::TickEnd);
                 }
+                // PlayerAction: runtime id, action, block position, result position, face.
+                PLAYER_ACTION if self.linked && self.spawn_status_sent => {
+                    read_uvarint128(&mut packet)?;
+                    let action = zigzag(read_uvarint(&mut packet)?);
+                    let pos = read_block_pos(&mut packet)?;
+                    read_block_pos(&mut packet)?;
+                    let face = zigzag(read_uvarint(&mut packet)?);
+                    self.block_action(action, pos, face);
+                }
+                INVENTORY_TRANSACTION if self.linked && self.spawn_status_sent => match read_click(&mut packet) {
+                    Ok(Some(u)) => {
+                        println!("Bedrock: clicked block {:?} face {} at {:?} -> Horizon", u.pos, u.face, u.click);
+                        let face = u.face.min(5) as u8;
+                        self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("Bedrock: can't read inventory transaction: {e}"),
+                },
                 PLAYER_AUTH_INPUT => {}
                 // Text: needs-translation, category, type; type 1 (chat) carries sender then message.
                 TEXT if self.linked && packet.get(2) == Some(&1) => {
@@ -312,6 +361,7 @@ impl Session {
                 COMMAND_REQUEST if self.linked => {
                     let n = read_uvarint(&mut packet)? as usize;
                     let line = String::from_utf8_lossy(take(&mut packet, n)?).into_owned();
+                    println!("Bedrock: command {line:?} -> Horizon");
                     self.to_java.push(crate::java::Command::Run(line.trim_start_matches('/').to_string()));
                 }
                 SERVERBOUND_LOADING_SCREEN => {
@@ -320,6 +370,13 @@ impl Session {
                     if kind == 1 {
                         self.loading_started = Some(std::time::Instant::now());
                     }
+                }
+                PACKET_VIOLATION_WARNING => {
+                    // type, severity, offending packet id, then a length-prefixed context string
+                    let _ = (read_uvarint(&mut packet)?, read_uvarint(&mut packet)?);
+                    let bad = zigzag(read_uvarint(&mut packet)?);
+                    read_uvarint(&mut packet)?;
+                    println!("Bedrock: client rejected our packet {bad}: {:?}", String::from_utf8_lossy(packet));
                 }
                 _ => {
                     if self.logged.insert(id) {
@@ -372,9 +429,38 @@ impl Session {
                 }
             }
             crate::java::Event::Chat { from, text, overlay } if !text.is_empty() => {
+                if from.is_none() && !overlay {
+                    println!("Bedrock: Horizon says {text:?}"); // command replies arrive as system chat
+                }
                 packets.push(packet_bytes(TEXT, &text_packet(from.as_deref(), &text, overlay)));
             }
             crate::java::Event::Chat { .. } => {}
+            crate::java::Event::AddPlayer { id, uuid, name, pos, yaw, pitch } => {
+                // The player list entry (with a skin) must come before AddPlayer, or the player is invisible.
+                let add = [
+                    packet_bytes(PLAYER_LIST, &player_list_add(&uuid, entity_id(id), &name)),
+                    packet_bytes(ADD_PLAYER, &add_player(&uuid, entity_id(id), &name, pos, yaw, pitch)),
+                ];
+                if self.spawned { packets.extend(add) } else { self.pending.extend(add) }
+            }
+            crate::java::Event::MoveEntity { id, pos, yaw, pitch, head_yaw } if self.spawned => {
+                packets.push(move_entity(entity_id(id), pos, pitch, yaw, head_yaw));
+            }
+            crate::java::Event::MoveEntity { .. } => {}
+            crate::java::Event::RemoveEntity { id, uuid } => {
+                packets.push(packet_bytes(REMOVE_ACTOR, &W::default().varint64(entity_id(id) as i64).0));
+                let mut list = W::default();
+                list.varuint(1).varuint(0).u8(1).bytes(&bedrock_uuid(&uuid)); // one entry: remove
+                packets.push(packet_bytes(PLAYER_LIST, &list.0));
+            }
+            crate::java::Event::Block { pos, state } => {
+                // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
+                let mut w = W::default();
+                w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
+                w.varuint(3).varuint(0); // flags: neighbours + network; layer 0
+                let p = packet_bytes(UPDATE_BLOCK, &w.0);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
             crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data) {
                 Ok((count, payload)) => {
                     let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
@@ -396,6 +482,43 @@ impl Session {
         w.varint(self.pos[0].floor() as i32).varint(self.pos[1].floor() as i32).varint(self.pos[2].floor() as i32);
         w.varuint(self.radius as u32 * 16).bytes(&0u32.to_le_bytes()); // radius in blocks, no saved chunks
         packet_bytes(NETWORK_CHUNK_PUBLISHER_UPDATE, &w.0)
+    }
+
+    /// A Bedrock block action (server-authoritative breaking) as Java digging. Java creative breaks on "start";
+    /// survival needs "start", then "finish" once the block is predicted broken.
+    fn block_action(&mut self, action: i32, pos: [i32; 3], face: i32) {
+        let status = match action {
+            START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK => {
+                self.breaking = Some(pos);
+                0
+            }
+            ABORT_DESTROY_BLOCK => {
+                self.breaking = None;
+                1
+            }
+            CREATIVE_DESTROY_BLOCK | PREDICT_DESTROY_BLOCK if self.game_mode == 1 => {
+                if self.breaking.take() == Some(pos) {
+                    return; // already broken by "start"
+                }
+                0
+            }
+            PREDICT_DESTROY_BLOCK => {
+                self.breaking = None;
+                2
+            }
+            // PlayerAction's stop has no position: finish the block we started on.
+            STOP_DESTROY_BLOCK if self.game_mode != 1 => match self.breaking.take() {
+                Some(started) => return self.dig(action, 2, started, face),
+                None => return,
+            },
+            _ => return, // crack progress, stop
+        };
+        self.dig(action, status, pos, face);
+    }
+
+    fn dig(&mut self, action: i32, status: i32, pos: [i32; 3], face: i32) {
+        println!("Bedrock: block action {action} at {pos:?} -> Horizon dig {status}");
+        self.to_java.push(crate::java::Command::Dig { status, pos, face: face.clamp(0, 5) as u8 });
     }
 
     fn move_player(&self) -> Vec<u8> {
@@ -535,6 +658,77 @@ fn player_metadata() -> Vec<u8> {
     w.meta(54, FLOAT).f32(1.8); // bounding box height
     w.varuint(0).varuint(0).varuint64(0); // no synced int/float properties, input tick
     w.0
+}
+
+/// Bedrock runtime and unique id for a Java entity id; 1 is the local player.
+fn entity_id(java: i32) -> u64 {
+    java as u32 as u64 + 2
+}
+
+/// A Java UUID (big-endian bytes) as Bedrock writes it: each 8-byte half little-endian, most significant first.
+fn bedrock_uuid(java: &[u8; 16]) -> [u8; 16] {
+    let mut b = *java;
+    b[..8].reverse();
+    b[8..].reverse();
+    b
+}
+
+/// Skin for a Java player: offline servers send none, and Mojang's default skins can't be bundled, so a plain
+/// two-tone skin coloured from the UUID. shortcut: real skins need the profile's textures URL fetched and decoded.
+fn generated_skin(w: &mut W, uuid: &[u8; 16]) {
+    let colour = [uuid[0] | 0x40, uuid[1] | 0x40, uuid[2] | 0x40, 255];
+    let face = [0xD8, 0xA0, 0x80, 255];
+    let image: Vec<u8> = (0..64 * 64).flat_map(|i| if i / 64 < 16 { face } else { colour }).collect(); // top rows: head
+    let patch = br#"{"geometry":{"default":"geometry.humanoid.custom"}}"#;
+    w.string(&format!("horizon-{:02x}{:02x}", uuid[14], uuid[15])); // skin id
+    w.varuint(patch.len() as u32).bytes(patch);
+    w.bytes(&64u32.to_le_bytes()).bytes(&64u32.to_le_bytes()).varuint(image.len() as u32).bytes(&image);
+    w.varuint(0); // no animations
+    w.bytes(&0u32.to_le_bytes()).bytes(&0u32.to_le_bytes()).varuint(0); // no cape
+    // Geometry data must parse as JSON (an empty string is rejected); the patch already names a built-in geometry.
+    w.string("{}").string("0.0.0").string(""); // geometry data, engine version, animation data
+    w.string("").string(""); // cape id, full id
+    w.u8(1).bytes(&[0, 0, 0, 0]); // arm size: wide, skin colour (ARGB)
+    w.varuint(0).varuint(0); // no persona pieces, no tint colours
+    w.bool(false).bool(false).bool(false).bool(false).bool(false); // premium, persona, cape on classic, primary user, override
+    w.string("false").string(""); // trusted skin, profile hash
+}
+
+/// PlayerList with one "add" entry.
+fn player_list_add(uuid: &[u8; 16], id: u64, name: &str) -> Vec<u8> {
+    let mut w = W::default();
+    w.varuint(1).varuint(1).u8(0).bytes(&bedrock_uuid(uuid)); // one entry: add
+    w.varint64(id as i64).string(name).string("").string("").string(""); // unique id, name, XUID, PlayFab, chat id
+    w.bytes(&PLATFORM_UNKNOWN.to_le_bytes()); // build platform
+    generated_skin(&mut w, uuid);
+    w.bool(false).bool(false).bool(false).bytes(&[0xFF, 0xFF, 0xFF, 0xFF]); // teacher, host, sub-client, colour
+    w.0
+}
+
+/// AddPlayer for another player at a Java feet position (Bedrock players are positioned at eye height).
+fn add_player(uuid: &[u8; 16], id: u64, name: &str, pos: [f64; 3], yaw: f32, pitch: f32) -> Vec<u8> {
+    let mut w = W::default();
+    w.bytes(&bedrock_uuid(uuid)).string(name).varuint64(id).string("");
+    w.f32(pos[0] as f32).f32(pos[1] as f32 + 1.62).f32(pos[2] as f32);
+    w.f32(0.0).f32(0.0).f32(0.0).f32(pitch).f32(yaw).f32(yaw); // velocity, pitch, yaw, head yaw
+    w.bytes(&[0; 8]); // held item: empty item instance
+    w.varint(0); // game type
+    // metadata: flags (gravity, collision, breathing, climb) and bounding box; no synced properties
+    w.varuint(3);
+    w.meta(0, 7).varint64(1 << 19 | 1 << 35 | 1 << 48 | 1 << 49);
+    w.meta(53, 3).f32(0.6).meta(54, 3).f32(1.8);
+    w.varuint(0).varuint(0);
+    w.bytes(&(id as i64).to_le_bytes()).u8(1).u8(0).varuint(0); // abilities: unique id, member, any, no layers
+    w.varuint(0).bool(false).string("").bytes(&PLATFORM_UNKNOWN.to_le_bytes()); // no links, not on a block, device id, platform
+    w.0
+}
+
+/// MovePlayer for another player (normal mode, so the client interpolates).
+fn move_entity(id: u64, pos: [f64; 3], pitch: f32, yaw: f32, head_yaw: f32) -> Vec<u8> {
+    let mut w = W::default();
+    w.varuint64(id).f32(pos[0] as f32).f32(pos[1] as f32 + 1.62).f32(pos[2] as f32);
+    w.f32(pitch).f32(yaw).f32(head_yaw).u8(0).bool(true).varuint64(0).bool(false).varuint64(0);
+    packet_bytes(MOVE_PLAYER, &w.0)
 }
 
 /// Text packet: a player's chat (type 1, authored) when there is a sender, else raw (0) or tip (5, the action bar).
@@ -687,6 +881,103 @@ fn jwt_claims(jwt: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| format!("JWT claims: {e}"))
 }
 
+fn read_block_pos(r: &mut &[u8]) -> Result<[i32; 3], String> {
+    Ok([zigzag(read_uvarint(r)?), zigzag(read_uvarint(r)?), zigzag(read_uvarint(r)?)])
+}
+
+/// The rest of PlayerAuthInput after the input flags, up to and including this tick's block actions
+/// as (PlayerActionType, position, face).
+fn read_block_actions(r: &mut &[u8], flags: u128) -> Result<Vec<(i32, [i32; 3], i32)>, String> {
+    for _ in 0..3 {
+        read_uvarint(r)?; // input mode, play mode, interaction model
+    }
+    take(r, 8)?; // interact rotation
+    read_uvarint128(r)?; // client tick
+    take(r, 12)?; // position delta
+    if flags & PERFORM_ITEM_INTERACTION != 0 {
+        skip_legacy_slots(r)?;
+        read_item_use(r)?;
+    }
+    if flags & PERFORM_ITEM_STACK_REQUEST != 0 {
+        // shortcut: item stack requests aren't decoded; they come with inventory support.
+        return Err("item stack request before the block actions".into());
+    }
+    let n = read_uvarint(r)?;
+    if n > 100 {
+        return Err(format!("{n} block actions"));
+    }
+    (0..n).map(|_| Ok((zigzag(read_uvarint(r)?), read_block_pos(r)?, zigzag(read_uvarint(r)?)))).collect()
+}
+
+/// Legacy item stack request id, then its container slot list when the id is set.
+fn skip_legacy_slots(r: &mut &[u8]) -> Result<(), String> {
+    if read_uvarint(r)? != 0 {
+        for _ in 0..read_uvarint(r)? {
+            read_uvarint(r)?; // container
+            let n = read_uvarint(r)? as usize;
+            take(r, n)?; // slots
+        }
+    }
+    Ok(())
+}
+
+/// NetworkItemStackDescriptor: id (i16), count (u16), aux, net id, block runtime id, user data. Empty is 8 bytes.
+fn skip_item(r: &mut &[u8]) -> Result<(), String> {
+    take(r, 4)?;
+    for _ in 0..3 {
+        read_uvarint(r)?;
+    }
+    let n = read_uvarint(r)? as usize;
+    take(r, n).map(|_| ())
+}
+
+struct ItemUse {
+    /// ItemUseActionType: 0 place (click a block), 1 use, 2 destroy.
+    action: i32,
+    /// 1 = player input; 2 = repeated by the simulation while the button is held.
+    trigger: u32,
+    pos: [i32; 3],
+    face: u32,
+    /// Hit point within the block (0..1).
+    click: [f32; 3],
+}
+
+fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
+    for _ in 0..read_uvarint(r)? {
+        if matches!(read_uvarint(r)?, 0 | 2 | 99999) {
+            read_uvarint(r)?; // container id, or world-interaction flags
+        }
+        read_uvarint(r)?; // slot
+        skip_item(r)?;
+        skip_item(r)?;
+    }
+    let action = zigzag(read_uvarint(r)?);
+    let trigger = read_uvarint(r)?;
+    let pos = read_block_pos(r)?;
+    let face = read_uvarint(r)?;
+    read_uvarint(r)?; // hotbar slot
+    read_uvarint(r)?; // hand
+    skip_item(r)?;
+    take(r, 12)?; // player position
+    let mut click = [0f32; 3];
+    for c in &mut click {
+        *c = f32::from_le_bytes(take(r, 4)?.try_into().unwrap());
+    }
+    read_uvarint(r)?; // target block runtime id
+    take(r, 2)?; // client prediction, cooldown state
+    Ok(ItemUse { action, trigger, pos, face, click })
+}
+
+/// InventoryTransaction: a player-input click on a block (item-use transaction, type 2, action "place").
+fn read_click(r: &mut &[u8]) -> Result<Option<ItemUse>, String> {
+    skip_legacy_slots(r)?;
+    if read_uvarint(r)? != 2 {
+        return Ok(None);
+    }
+    let u = read_item_use(r)?;
+    Ok((u.action == 0 && u.trigger == 1).then_some(u))
+}
+
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
     let head = r.get(..n).ok_or("truncated packet")?;
     *r = &r[n..];
@@ -743,6 +1034,35 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_block_actions_after_an_item_use() {
+        let mut p = vec![0, 0, 0]; // input mode, play mode, interaction model
+        p.extend([0; 8]); // interact rotation
+        p.push(1); // tick
+        p.extend([0; 12]); // position delta
+        // item use: no legacy id, no actions, destroy (zigzag 2), player input, block 0,0,0, face 1, slot, hand,
+        // empty item, player position, click position, target block, prediction, cooldown
+        p.extend([0, 0, 4, 1, 0, 0, 0, 1, 0, 0]);
+        p.extend([0; 8 + 12 + 12 + 1 + 2]);
+        // one block action: predict destroy (26) at (-2, 67, 25), face 1
+        p.extend([1, 52, 3, 0x86, 0x01, 50, 2]);
+        let actions = read_block_actions(&mut &p[..], PERFORM_ITEM_INTERACTION | PERFORM_BLOCK_ACTIONS).unwrap();
+        assert_eq!(actions, [(PREDICT_DESTROY_BLOCK, [-2, 67, 25], 1)]);
+    }
+
+    #[test]
+    fn creative_break_from_player_action() {
+        let mut s = Session { linked: true, spawn_status_sent: true, ..Default::default() };
+        // Recorded from a 26.60 client in creative: CreativeDestroyBlock at (189, 66, 57), face 1.
+        let body = [36, 0x01, 0x1a, 0xfa, 0x02, 0x84, 0x01, 0x72, 0, 0, 0, 0x02];
+        s.on_message(&[&[body.len() as u8][..], &body].concat()).unwrap();
+        let cmds = s.take_to_java();
+        assert!(
+            matches!(cmds[..], [crate::java::Command::Dig { status: 0, pos: [189, 66, 57], face: 1 }]),
+            "one creative dig"
+        );
+    }
 
     #[test]
     fn answers_request_network_settings() {
@@ -857,6 +1177,14 @@ mod tests {
         s.pos[1] = 70.5;
         s.on_message(&b).unwrap();
         assert!(matches!(s.take_to_java()[..], [crate::java::Command::Move { on_ground: true, .. }, crate::java::Command::TickEnd]));
+    }
+
+    #[test]
+    fn bedrock_uuid_halves_are_little_endian() {
+        let java: [u8; 16] = std::array::from_fn(|i| i as u8);
+        assert_eq!(bedrock_uuid(&java), [7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8]);
+        // A player list entry carries the full 64x64 RGBA skin.
+        assert!(player_list_add(&java, 5, "Alex").len() > 64 * 64 * 4);
     }
 
     #[test]
