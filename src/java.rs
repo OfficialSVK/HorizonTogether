@@ -223,6 +223,28 @@ pub enum Event {
     RemoveEntity { id: i32, uuid: [u8; 16] },
     /// A block changed to a Java block state.
     Block { pos: [i32; 3], state: u32 },
+    /// Rain and thunder strength, 0..1.
+    Rain(f32),
+    Thunder(f32),
+    /// The overworld clock was set (join, /time): total ticks; time of day is ticks % 24000.
+    Time(i64),
+}
+
+/// set_time (26.3): game time (i64), then changed world clocks `[varint clock id, varlong ticks, f32 partial tick,
+/// f32 rate]`; the periodic packets list none. shortcut: clock 0 is assumed to be minecraft:overworld (first in the
+/// vanilla world_clock registry); the registry isn't read from configuration.
+fn overworld_time(mut r: &[u8]) -> io::Result<Option<i64>> {
+    take_bytes(&mut r, 8)?;
+    let mut ticks = None;
+    for _ in 0..read_varlong(&mut r)? {
+        let clock = read_varlong(&mut r)?;
+        let t = read_varlong(&mut r)?;
+        take_bytes(&mut r, 8)?;
+        if clock == 0 {
+            ticks = Some(t);
+        }
+    }
+    Ok(ticks)
 }
 
 /// Java's packed block position: x and z 26 bits, y 12 bits.
@@ -763,6 +785,25 @@ pub async fn play(
                     }
                 }
             }
+            (State::Game, 0x27) if matches!(body.first(), Some(2 | 7 | 8)) => {
+                // game_event: 2 stop raining, 7 rain level, 8 thunder level (f32 parameter, 0..1).
+                let level = body.get(1..5).map(|b| f32::from_be_bytes(b.try_into().unwrap())).unwrap_or(0.0);
+                let e = match body[0] {
+                    2 => Event::Rain(0.0),
+                    7 => Event::Rain(level),
+                    _ => Event::Thunder(level),
+                };
+                if events.send(e).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x73) => {
+                if let Some(ticks) = overworld_time(&body)?
+                    && events.send(Event::Time(ticks)).is_err()
+                {
+                    return Ok(());
+                }
+            }
             (State::Game, 0x08 | 0x56) => {
                 let blocks = if id == 0x08 {
                     // block_update: position, block state
@@ -868,6 +909,17 @@ mod tests {
     }
 
     #[test]
+    fn reads_overworld_clock() {
+        // Captured from Horizon on join: game time 73063, clocks 0 (109329 ticks) and 1 (73063), both at rate 1.
+        let join = [
+            0, 0, 0, 0, 0, 1, 0x1d, 0x67, 2, 0, 0x91, 0xd6, 6, 0, 0, 0, 0, 0x3f, 0x80, 0, 0, 1, 0xe7, 0xba, 4, 0, 0, 0,
+            0, 0x3f, 0x80, 0, 0,
+        ];
+        assert_eq!(overworld_time(&join).unwrap(), Some(109329));
+        assert_eq!(overworld_time(&[0, 0, 0, 0, 0, 1, 0x1d, 0x68, 0]).unwrap(), None, "periodic: no clock change");
+    }
+
+    #[test]
     fn block_positions() {
         for p in [[0, 0, 0], [-1, -64, 5], [29_999_999, 319, -30_000_000]] {
             assert_eq!(read_block_pos(&mut &block_pos(p)[..]).unwrap(), p);
@@ -936,6 +988,9 @@ mod tests {
                 Event::Chat { from, text, .. } => println!("chat from {from:?}: {text}"),
                 Event::AddPlayer { name, pos, .. } => println!("player {name} at {pos:?}"),
                 Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } => {}
+                Event::Rain(v) => println!("rain {v}"),
+                Event::Thunder(v) => println!("thunder {v}"),
+                Event::Time(t) => println!("time {t}"),
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;

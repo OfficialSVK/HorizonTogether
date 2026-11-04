@@ -43,6 +43,8 @@ const VOXEL_SHAPES: u32 = 337;
 
 const PLAYER_AUTH_INPUT: u32 = 144;
 const UPDATE_BLOCK: u32 = 21;
+const LEVEL_EVENT: u32 = 25;
+const SET_TIME: u32 = 10;
 const INVENTORY_TRANSACTION: u32 = 30;
 /// PlayerAuthInput flags that add optional sections after the fixed fields.
 const PERFORM_ITEM_INTERACTION: u128 = 1 << 34;
@@ -453,6 +455,18 @@ impl Session {
                 list.varuint(1).varuint(0).u8(1).bytes(&bedrock_uuid(&uuid)); // one entry: remove
                 packets.push(packet_bytes(PLAYER_LIST, &list.0));
             }
+            crate::java::Event::Rain(level) => {
+                let p = weather(level, 3001, 3003);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            crate::java::Event::Thunder(level) => {
+                let p = weather(level, 3002, 3004);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            crate::java::Event::Time(ticks) => {
+                let p = packet_bytes(SET_TIME, &W::default().varint(ticks as i32).0);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
             crate::java::Event::Block { pos, state } => {
                 // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
                 let mut w = W::default();
@@ -729,6 +743,15 @@ fn move_entity(id: u64, pos: [f64; 3], pitch: f32, yaw: f32, head_yaw: f32) -> V
     w.varuint64(id).f32(pos[0] as f32).f32(pos[1] as f32 + 1.62).f32(pos[2] as f32);
     w.f32(pitch).f32(yaw).f32(head_yaw).u8(0).bool(true).varuint64(0).bool(false).varuint64(0);
     packet_bytes(MOVE_PLAYER, &w.0)
+}
+
+/// LevelEvent starting (strength 0..1 scaled to 0..65535) or stopping rain or thunder. Event ids from gophertunnel:
+/// start rain 3001, start thunder 3002, stop rain 3003, stop thunder 3004.
+fn weather(level: f32, start: i32, stop: i32) -> Vec<u8> {
+    let mut w = W::default();
+    w.varint(if level > 0.0 { start } else { stop }).f32(0.0).f32(0.0).f32(0.0);
+    w.varint((level.clamp(0.0, 1.0) * 65535.0) as i32);
+    packet_bytes(LEVEL_EVENT, &w.0)
 }
 
 /// Text packet: a player's chat (type 1, authored) when there is a sender, else raw (0) or tip (5, the action bar).
