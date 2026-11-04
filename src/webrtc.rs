@@ -54,6 +54,7 @@ impl Drop for AbortOnDrop {
 fn run(mut rtc: Rtc, socket: UdpSocket, rt: tokio::runtime::Handle) -> Result<(), RtcError> {
     let mut _java: Option<AbortOnDrop> = None;
     let mut java_events: Option<std::sync::mpsc::Receiver<crate::java::Event>> = None;
+    let mut java_commands: Option<tokio::sync::mpsc::UnboundedSender<crate::java::Command>> = None;
     let mut reliable = None;
     let mut outbox = VecDeque::new();
     let mut parts: HashMap<_, Reassembler> = HashMap::new();
@@ -64,10 +65,12 @@ fn run(mut rtc: Rtc, socket: UdpSocket, rt: tokio::runtime::Handle) -> Result<()
         if let Some(name) = session.take_joined() {
             let addr = crate::HORIZON.get().cloned().unwrap_or_default();
             let (tx, rx) = std::sync::mpsc::channel();
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
             java_events = Some(rx);
+            java_commands = Some(cmd_tx);
             session.set_linked();
             _java = Some(AbortOnDrop(rt.spawn(async move {
-                if let Err(e) = crate::java::play(addr, name, tx).await {
+                if let Err(e) = crate::java::play(addr, name, tx, cmd_rx).await {
                     eprintln!("Java: {e}");
                 }
             })));
@@ -79,6 +82,11 @@ fn run(mut rtc: Rtc, socket: UdpSocket, rt: tokio::runtime::Handle) -> Result<()
         }
         for msg in session.poll() {
             let _ = enqueue(&mut outbox, &msg);
+        }
+        for cmd in session.take_to_java() {
+            if let Some(tx) = &java_commands {
+                let _ = tx.send(cmd);
+            }
         }
         if let Some(id) = reliable
             && let Err(e) = flush(&mut rtc, id, &mut outbox)

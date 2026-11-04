@@ -33,6 +33,7 @@ const SERVERBOUND_LOADING_SCREEN: u32 = 312;
 const JIGSAW_STRUCTURE_DATA: u32 = 313;
 const VOXEL_SHAPES: u32 = 337;
 
+const PLAYER_AUTH_INPUT: u32 = 144;
 const SPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// PlayStatus values.
@@ -48,6 +49,8 @@ pub struct Session {
     linked: bool,
     /// Horizon has told us where the player is.
     java_ready: bool,
+    /// Java game mode Horizon gave the player (creative for the flat test world).
+    game_mode: u8,
     /// Player feet position and [pitch, yaw], as Horizon last sent them.
     pos: [f32; 3],
     rot: [f32; 2],
@@ -55,6 +58,8 @@ pub struct Session {
     radius: i32,
     /// Translated Horizon chunks waiting for the spawn sequence.
     pending: Vec<Vec<u8>>,
+    /// Player actions waiting to be sent to Horizon (see `take_to_java`).
+    to_java: Vec<crate::java::Command>,
     /// The spawn packets (chunks, player state) have been sent.
     spawned: bool,
     /// When the client reported ServerboundLoadingScreen(start).
@@ -74,10 +79,12 @@ impl Default for Session {
             compressed: false,
             linked: false,
             java_ready: false,
+            game_mode: 1,
             pos: [0.5, 64.0, 0.5], // flat test world: standing on the grass
             rot: [0.0, 0.0],
             radius: 8,
             pending: Vec::new(),
+            to_java: Vec::new(),
             spawned: false,
             loading_started: None,
             spawn_status_sent: false,
@@ -250,10 +257,10 @@ impl Session {
                         packets.push(packet_bytes(CREATIVE_CONTENT, &[0, 0])); // no groups, no items
                         // What dragonfly/Geyser send for the local player at spawn.
                         packets.push(packet_bytes(UPDATE_ATTRIBUTES, &player_attributes()));
-                        packets.push(packet_bytes(UPDATE_ABILITIES, &abilities()));
+                        packets.push(packet_bytes(UPDATE_ABILITIES, &abilities(self.game_mode)));
                         // no PvM, no MvP, immutable world, show name tags, auto jump
                         packets.push(packet_bytes(UPDATE_ADVENTURE_SETTINGS, &[0, 0, 0, 1, 1]));
-                        packets.push(packet_bytes(SET_PLAYER_GAME_TYPE, &W::default().varint(1).0)); // creative
+                        packets.push(packet_bytes(SET_PLAYER_GAME_TYPE, &W::default().varint(bedrock_game_mode(self.game_mode)).0));
                         // Vanilla servers treat the first spawn as a respawn: Respawn(ready to spawn, runtime id 0),
                         // then metadata, then MovePlayer(respawn). Geyser does the same ("Bedrock server behavior").
                         let [x, y, z] = self.eye();
@@ -268,6 +275,29 @@ impl Session {
                     out.push(self.batch(&packets));
                 }
                 SET_LOCAL_PLAYER_AS_INITIALIZED => println!("Bedrock: player spawned into the world"),
+                // Every tick: rotation (pitch, yaw), then the eye position. Forward real changes to Horizon.
+                PLAYER_AUTH_INPUT if self.linked && self.spawn_status_sent => {
+                    let f = |i: usize| packet.get(i..i + 4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).ok_or("short PlayerAuthInput");
+                    let (pitch, yaw, x, y, z) = (f(0)?, f(4)?, f(8)?, f(12)? - 1.62, f(16)?);
+                    if [x, y, z] != self.pos || [pitch, yaw] != self.rot {
+                        let chunk = |p: [f32; 3]| (p[0].floor() as i32 >> 4, p[2].floor() as i32 >> 4);
+                        let new_chunk = chunk([x, y, z]) != chunk(self.pos);
+                        // Java's on_ground: Bedrock's VerticalCollision input flag (bit 50 of the varint flag set
+                        // after pitch, yaw, position, move vector and head yaw), while not moving up.
+                        let flags = read_uvarint128(&mut packet.get(32..).ok_or("short PlayerAuthInput")?)?;
+                        let on_ground = flags & (1 << 50) != 0 && y <= self.pos[1];
+                        self.pos = [x, y, z];
+                        self.rot = [pitch, yaw];
+                        self.to_java.push(crate::java::Command::Move {
+                            x: x as f64, y: y as f64, z: z as f64, yaw, pitch, on_ground,
+                        });
+                        if new_chunk {
+                            out.push(self.batch(&[self.publisher()])); // keep accepting Horizon's chunks around us
+                        }
+                    }
+                    self.to_java.push(crate::java::Command::TickEnd);
+                }
+                PLAYER_AUTH_INPUT => {}
                 SERVERBOUND_LOADING_SCREEN => {
                     let kind = zigzag(read_uvarint(&mut packet)?);
                     println!("Bedrock: client loading screen {}", ["unknown", "start", "end"].get(kind as usize).unwrap_or(&"?"));
@@ -294,6 +324,11 @@ impl Session {
         self.joined.take()
     }
 
+    /// What the player did since the last call, for the transport to send to Horizon.
+    pub fn take_to_java(&mut self) -> Vec<crate::java::Command> {
+        std::mem::take(&mut self.to_java)
+    }
+
     /// From now on the world comes from Horizon (via `on_java`) instead of the flat test world.
     pub fn set_linked(&mut self) {
         self.linked = true;
@@ -310,6 +345,14 @@ impl Session {
                 if self.spawned {
                     packets.push(self.publisher());
                     packets.push(self.move_player());
+                }
+            }
+            crate::java::Event::GameMode(mode) => {
+                println!("Bedrock: Horizon game mode {mode}");
+                self.game_mode = mode;
+                if self.spawned {
+                    packets.push(packet_bytes(SET_PLAYER_GAME_TYPE, &W::default().varint(bedrock_game_mode(mode)).0));
+                    packets.push(packet_bytes(UPDATE_ABILITIES, &abilities(mode)));
                 }
             }
             crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data) {
@@ -474,9 +517,19 @@ fn player_metadata() -> Vec<u8> {
     w.0
 }
 
-/// UpdateAbilities for a creative player. Without a base layer the client keeps walk speed at 0 and can't move
-/// (Geyser issue #3139). Bit numbers from gophertunnel's protocol/ability.go.
-fn abilities() -> Vec<u8> {
+/// Java game mode (0 survival, 1 creative, 2 adventure, 3 spectator) as Bedrock's GameType.
+fn bedrock_game_mode(java: u8) -> i32 {
+    match java {
+        1 => 1,
+        2 => 2,
+        3 => 6,
+        _ => 0,
+    }
+}
+
+/// UpdateAbilities for a Java game mode: only creative and spectator may fly. Without a base layer the client
+/// keeps walk speed at 0 and can't move (Geyser issue #3139). Bit numbers from gophertunnel's protocol/ability.go.
+fn abilities(game_mode: u8) -> Vec<u8> {
     const BUILD: u32 = 1 << 0;
     const MINE: u32 = 1 << 1;
     const DOORS_AND_SWITCHES: u32 = 1 << 2;
@@ -490,8 +543,13 @@ fn abilities() -> Vec<u8> {
     const VERTICAL_FLY_SPEED: u32 = 1 << 19;
     const ALL: u32 = (1 << 20) - 1;
     const BASE_LAYER: u16 = 1;
-    let values = BUILD | MINE | DOORS_AND_SWITCHES | OPEN_CONTAINERS | ATTACK_PLAYERS | ATTACK_MOBS | MAY_FLY
-        | INSTANT_BUILD | FLY_SPEED | WALK_SPEED | VERTICAL_FLY_SPEED;
+    let mut values = DOORS_AND_SWITCHES | OPEN_CONTAINERS | ATTACK_PLAYERS | ATTACK_MOBS | FLY_SPEED | WALK_SPEED | VERTICAL_FLY_SPEED;
+    match game_mode {
+        1 => values |= BUILD | MINE | MAY_FLY | INSTANT_BUILD,
+        2 => {}                     // adventure: no building or mining
+        3 => values = MAY_FLY | FLY_SPEED | WALK_SPEED | VERTICAL_FLY_SPEED, // spectator
+        _ => values |= BUILD | MINE, // survival
+    }
     let mut w = W::default();
     w.bytes(&1i64.to_le_bytes()).u8(1).u8(0).varuint(1); // our unique id, permission: member, commands: any, one layer
     w.bytes(&BASE_LAYER.to_le_bytes()).bytes(&ALL.to_le_bytes()).bytes(&values.to_le_bytes());
@@ -628,6 +686,20 @@ fn read_uvarint(r: &mut &[u8]) -> Result<u32, String> {
     Err("varint too long".into())
 }
 
+/// Varint of up to 128 bits (PlayerAuthInput's input flag set has 66).
+fn read_uvarint128(r: &mut &[u8]) -> Result<u128, String> {
+    let mut v = 0u128;
+    for i in 0..19 {
+        let (&b, rest) = r.split_first().ok_or("truncated varint")?;
+        *r = rest;
+        v |= ((b & 0x7F) as u128) << (7 * i);
+        if b & 0x80 == 0 {
+            return Ok(v);
+        }
+    }
+    Err("varint too long".into())
+}
+
 fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
     while v >= 0x80 {
         out.push(v as u8 | 0x80);
@@ -698,7 +770,9 @@ mod tests {
             ],
             "spawn after the chunks"
         );
-        assert_eq!(abilities().len(), 8 + 1 + 1 + 1 + 2 + 4 + 4 + 12);
+        assert_eq!(abilities(1).len(), 8 + 1 + 1 + 1 + 2 + 4 + 4 + 12);
+        let values = |m| u32::from_le_bytes(abilities(m)[17..21].try_into().unwrap());
+        assert!(values(1) & (1 << 10) != 0 && values(0) & (1 << 10) == 0, "only creative may fly");
         let start_loading = [W::default().varint(1).0[0], 0]; // StartLoadingScreen, no id
         assert!(send(&mut s, SERVERBOUND_LOADING_SCREEN, &start_loading).is_empty());
         assert!(s.poll().is_empty(), "too early");
@@ -722,6 +796,35 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn movement_goes_to_java_at_feet_height() {
+        let mut s = Session { compressed: true, linked: true, spawn_status_sent: true, ..Default::default() };
+        let mut input = Vec::new();
+        for v in [10.0f32, 90.0, 1.5, 71.62, -3.5, 0.0, 0.0, 0.0] {
+            input.extend(v.to_le_bytes()); // pitch, yaw, eye position, move vector, head yaw
+        }
+        let mut flags = 1u128 << 50; // VerticalCollision
+        while flags >= 0x80 {
+            input.push(flags as u8 | 0x80);
+            flags >>= 7;
+        }
+        input.push(flags as u8);
+        let p = packet_bytes(PLAYER_AUTH_INPUT, &input);
+        let mut b = vec![0xFF];
+        write_uvarint(&mut b, p.len() as u32);
+        b.extend(p);
+        s.on_message(&b).unwrap();
+        let cmds = s.take_to_java();
+        assert!(matches!(cmds[..], [crate::java::Command::Move { x, y, z, yaw, pitch, on_ground: false }, crate::java::Command::TickEnd]
+            if x == 1.5 && (y - 70.0).abs() < 1e-4 && z == -3.5 && yaw == 90.0 && pitch == 10.0));
+        s.on_message(&b).unwrap(); // same position again: only the tick end
+        assert!(matches!(s.take_to_java()[..], [crate::java::Command::TickEnd]));
+        // Landing (vertical collision, not moving up) is on the ground; the first tick was a rise from y=64.
+        s.pos[1] = 70.5;
+        s.on_message(&b).unwrap();
+        assert!(matches!(s.take_to_java()[..], [crate::java::Command::Move { on_ground: true, .. }, crate::java::Command::TickEnd]));
     }
 
     #[test]

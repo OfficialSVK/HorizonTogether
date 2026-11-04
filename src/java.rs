@@ -118,9 +118,10 @@ pub fn java_name(gamertag: &str) -> String {
 /// Largest Java packet we accept (vanilla's own limit is 2 MiB compressed, 8 MiB uncompressed).
 const MAX_PACKET: usize = 8 << 20;
 
-/// A Java connection: length-prefixed packets, zlib-compressed once the server enables it.
+/// Sending side of a Java connection: length-prefixed packets, zlib-compressed once the server enables it.
+/// Packets are framed here (with the threshold in force at that moment) and written by a writer task.
 struct Conn {
-    s: TcpStream,
+    out: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     threshold: Option<usize>,
 }
 
@@ -139,30 +140,61 @@ impl Conn {
                 f
             }
         };
-        self.s.write_all(&frame(framed)).await
+        self.out.send(frame(framed)).map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
     }
+}
 
-    async fn recv(&mut self) -> io::Result<(i32, Vec<u8>)> {
-        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-        let len = read_varint(&mut self.s).await? as usize;
-        if len > MAX_PACKET {
-            return Err(bad("packet too large"));
-        }
-        let mut buf = vec![0u8; len];
-        self.s.read_exact(&mut buf).await?;
-        let mut r = &buf[..];
-        let body = match self.threshold {
-            None => r.to_vec(),
-            Some(_) => match read_varint(&mut r).await? as usize {
-                0 => r.to_vec(),
-                n if n > MAX_PACKET => return Err(bad("packet too large")),
-                n => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(r, n).map_err(|_| bad("bad zlib data"))?,
-            },
-        };
-        let mut r = &body[..];
-        let id = read_varint(&mut r).await?;
-        Ok((id, r.to_vec()))
+async fn recv<R: AsyncRead + Unpin>(rd: &mut R, threshold: Option<usize>) -> io::Result<(i32, Vec<u8>)> {
+    let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+    let len = read_varint(rd).await? as usize;
+    if len > MAX_PACKET {
+        return Err(bad("packet too large"));
     }
+    let mut buf = vec![0u8; len];
+    rd.read_exact(&mut buf).await?;
+    let mut r = &buf[..];
+    let body = match threshold {
+        None => r.to_vec(),
+        Some(_) => match read_varint(&mut r).await? as usize {
+            0 => r.to_vec(),
+            n if n > MAX_PACKET => return Err(bad("packet too large")),
+            n => miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(r, n).map_err(|_| bad("bad zlib data"))?,
+        },
+    };
+    let mut r = &body[..];
+    let id = read_varint(&mut r).await?;
+    Ok((id, r.to_vec()))
+}
+
+/// Reads packets into a channel, so the main loop can also wait for Bedrock commands without losing a
+/// half-read packet. Tracks compression itself: in the login state, set_compression (0x03) arrives before
+/// login_finished (0x02), and compression applies from the very next packet.
+async fn read_packets<R: AsyncRead + Unpin>(mut rd: R, tx: tokio::sync::mpsc::UnboundedSender<io::Result<(i32, Vec<u8>)>>) {
+    let (mut threshold, mut login_done) = (None, false);
+    loop {
+        let packet = recv(&mut rd, threshold).await;
+        if let Ok((id, body)) = &packet
+            && !login_done
+        {
+            match id {
+                0x03 => threshold = Some(read_varint(&mut &body[..]).await.unwrap_or(0).max(0) as usize),
+                0x02 => login_done = true,
+                _ => {}
+            }
+        }
+        let failed = packet.is_err();
+        if tx.send(packet).is_err() || failed {
+            return;
+        }
+    }
+}
+
+/// What the Bedrock player does, for Horizon.
+pub enum Command {
+    /// Feet position and rotation, in Java terms.
+    Move { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, on_ground: bool },
+    /// The player's tick ended (sent every tick, as a Java client does).
+    TickEnd,
 }
 
 /// What Horizon tells the bridge about the world, for the Bedrock side to translate.
@@ -171,16 +203,57 @@ pub enum Event {
     Position { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
     /// A chunk column: the section data of a level_chunk_with_light packet.
     Chunk { x: i32, z: i32, data: Vec<u8> },
+    /// Java game mode: 0 survival, 1 creative, 2 adventure, 3 spectator.
+    GameMode(u8),
+}
+
+/// Game mode from the play login packet: entity id, hardcore, dimension names, max players, view and simulation
+/// distance, three flags, then spawn info (dimension type, dimension name, hashed seed, game mode).
+async fn login_game_mode(mut r: &[u8]) -> io::Result<u8> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "short play login");
+    r = r.get(5..).ok_or_else(bad)?;
+    let skip_string = |r: &mut &[u8], n: usize| -> io::Result<()> {
+        *r = r.get(n..).ok_or_else(bad)?;
+        Ok(())
+    };
+    for _ in 0..read_varint(&mut r).await? {
+        let n = read_varint(&mut r).await? as usize;
+        skip_string(&mut r, n)?;
+    }
+    for _ in 0..3 {
+        read_varint(&mut r).await?; // max players, view distance, simulation distance
+    }
+    r = r.get(3..).ok_or_else(bad)?;
+    read_varint(&mut r).await?; // dimension type
+    let n = read_varint(&mut r).await? as usize;
+    skip_string(&mut r, n)?;
+    r.get(8).copied().ok_or_else(bad) // after the hashed seed (i64)
 }
 
 /// Joins Horizon as a Java player and keeps the session alive until the server disconnects us or
 /// the Bedrock side goes away (the event receiver is dropped).
-pub async fn play(addr: String, name: String, events: std::sync::mpsc::Sender<Event>) -> io::Result<()> {
+pub async fn play(
+    addr: String,
+    name: String,
+    events: std::sync::mpsc::Sender<Event>,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
+) -> io::Result<()> {
     let (host, port) = addr
         .rsplit_once(':')
         .and_then(|(h, p)| Some((h.to_string(), p.parse::<u16>().ok()?)))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "expected host:port"))?;
-    let mut c = Conn { s: TcpStream::connect(&addr).await?, threshold: None };
+    let (rd, mut wr) = TcpStream::connect(&addr).await?.into_split();
+    let (out, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Some(bytes) = out_rx.recv().await {
+            if wr.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+    });
+    let (packets_tx, mut packets) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(read_packets(rd, packets_tx));
+    let mut c = Conn { out, threshold: None };
 
     let mut hs = Vec::new();
     write_varint(&mut hs, PROTOCOL);
@@ -202,7 +275,26 @@ pub async fn play(addr: String, name: String, events: std::sync::mpsc::Sender<Ev
     let mut state = State::Login;
     let (mut loaded, mut chunks) = (false, 0u32);
     loop {
-        let (id, body) = c.recv().await?;
+        let (id, body) = tokio::select! {
+            packet = packets.recv() => packet.ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))??,
+            Some(cmd) = commands.recv(), if state == State::Game => {
+                match cmd {
+                    Command::Move { x, y, z, yaw, pitch, on_ground } => {
+                        let mut m = Vec::with_capacity(33);
+                        for v in [x, y, z] {
+                            m.extend(v.to_be_bytes());
+                        }
+                        m.extend(yaw.to_be_bytes());
+                        m.extend(pitch.to_be_bytes());
+                        m.push(on_ground as u8); // flags: on ground, no horizontal collision
+                        c.send(0x1f, &m).await?; // move_player_pos_rot
+                    }
+                    // The server allows one position per client tick and kicks on a second (invalid_player_movement).
+                    Command::TickEnd => c.send(0x0d, &[]).await?, // client_tick_end
+                }
+                continue;
+            }
+        };
         let mut r = &body[..];
         match (state, id) {
             (State::Login, 0x00) | (State::Config, 0x02) | (State::Game, 0x20) => {
@@ -236,6 +328,19 @@ pub async fn play(addr: String, name: String, events: std::sync::mpsc::Sender<Ev
                 c.send(0x03, &[]).await?;
                 state = State::Game;
                 println!("Java: {name} joined Horizon");
+            }
+            (State::Game, 0x32) => {
+                let mode = login_game_mode(&body).await?;
+                if events.send(Event::GameMode(mode)).is_err() {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x27) if body.first() == Some(&3) => {
+                // game_event 3 = change game mode; the mode is the f32 parameter.
+                let mode = body.get(1..5).map(|b| f32::from_be_bytes(b.try_into().unwrap()) as u8).unwrap_or(0);
+                if events.send(Event::GameMode(mode)).is_err() {
+                    return Ok(());
+                }
             }
             (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
             (State::Game, 0x3e) => c.send(0x2d, &body).await?, // ping -> pong
@@ -310,12 +415,24 @@ mod tests {
     #[ignore]
     async fn joins_local_horizon() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx)).await;
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Walk 2 blocks east after a second; Horizon must accept it (no "moved too quickly" kick).
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            for i in 1..=20 {
+                let x = -7.5 + i as f64 * 0.1;
+                let _ = cmd_tx.send(Command::Move { x, y: 70.0, z: 20.5, yaw: 0.0, pitch: 0.0, on_ground: true });
+                let _ = cmd_tx.send(Command::TickEnd);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx)).await;
         assert!(r.is_err(), "still connected after 8 s (expected); ended early with {r:?}");
         // Every chunk Horizon sent must translate into a Bedrock chunk.
         let (mut chunks, mut pos) = (0, None);
         for e in rx.try_iter() {
             match e {
+                Event::GameMode(m) => println!("game mode {m}"),
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data).expect("translates");
                     chunks += 1;
