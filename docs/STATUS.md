@@ -17,7 +17,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Horizon link | Each Bedrock player also joins Horizon as a Java 26.3 player named `.<gamertag>`: offline login, configuration, keep-alives, teleports and chunk acks. Java players see them; they leave Horizon when they leave Bedrock. | `src/java.rs`, `src/webrtc.rs` |
 | Horizon's world on Bedrock | Horizon's chunks are translated to Bedrock sub-chunks (Java block states mapped through Geyser's table), and the player spawns at Horizon's position. Verified: a real Horizon world renders correctly. | `src/world.rs`, `data/java_blocks.bin` |
 | Movement and game mode | Bedrock movement moves the Java player (one position per tick, ground state from Bedrock's collision flag), new terrain loads as you walk, and Horizon's game mode is applied on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
-| Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
+| Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock in full (Java's English text, read from the language file Horizon's launcher extracted; `HORIZON_LANG` overrides the path). Bedrock lists and completes the command names the player may use (not their arguments). | `src/bedrock.rs`, `src/java.rs` |
 | Other players | Java players appear on Bedrock (name tag, generated Steve-shaped skin), move, and disappear when they leave. What they hold and their armour are shown. | `src/bedrock.rs`, `src/java.rs` |
 | Blocks | Breaking (creative and survival, with tools; the crack animation runs at Java's mining speed) and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
 | Crafting | The inventory's 2x2 grid and crafting tables: Bedrock shows results from its own recipes, and Horizon crafts (grid filled and result taken with Java clicks). | `data/crafting_data.bin`, `tools/gen_recipes.py` |
@@ -29,7 +29,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 45 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 47 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 

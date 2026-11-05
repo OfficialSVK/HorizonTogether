@@ -166,6 +166,8 @@ pub struct Session {
     placing: Option<([i32; 3], std::time::Instant)>,
     /// Bedrock variant per Java registry id, by registry (cat, wolf, frog variants).
     variants: std::collections::HashMap<String, Vec<i32>>,
+    /// Horizon's top-level commands for this player (Bedrock's command list and autocomplete).
+    commands: Vec<String>,
 }
 
 impl Default for Session {
@@ -209,6 +211,7 @@ impl Default for Session {
             on_ground: true,
             placing: None,
             variants: Default::default(),
+            commands: Vec::new(),
         }
     }
 }
@@ -342,8 +345,9 @@ impl Session {
                             packet_bytes(ITEM_REGISTRY, include_bytes!("../data/item_registry.bin")),
                             // Vanilla entity types, including minecraft:player (see data/README.md).
                             packet_bytes(AVAILABLE_ACTOR_IDENTIFIERS, include_bytes!("../data/entity_identifiers.dat")),
-                            // PocketMine sends both before spawn: no commands, no recipes (8 and 11 empty lists).
-                            packet_bytes(AVAILABLE_COMMANDS, &[0; 8]),
+                            // PocketMine sends both before spawn: Horizon's commands so far (sent again when they
+                            // come), recipes.
+                            packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands)),
                             // Bedrock's crafting-table recipes (tools/gen_recipes.py): the client only shows a
                             // crafting result it has a recipe for; Horizon does the crafting.
                             packet_bytes(CRAFTING_DATA, include_bytes!("../data/crafting_data.bin")),
@@ -936,6 +940,13 @@ impl Session {
             crate::java::Event::BlockBroken { pos, state } if self.spawned => packets.push(destroyed(pos, state)),
             crate::java::Event::BlockBroken { .. } => {}
             crate::java::Event::Biomes(biomes) => self.biomes = biomes,
+            crate::java::Event::Commands(names) => {
+                println!("Bedrock: {} commands from Horizon", names.len());
+                self.commands = names;
+                if self.spawned {
+                    packets.push(packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands)));
+                }
+            }
             crate::java::Event::Variants { registry, names } => {
                 let ids = names.iter().map(|n| bedrock_variant(&registry, n)).collect();
                 self.variants.insert(registry, ids);
@@ -1718,6 +1729,25 @@ fn read_stack(r: &mut &[u8]) -> Result<(i16, u16), String> {
 /// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
 const SHIELD: i16 = 358;
 
+/// AvailableCommands (layout from gophertunnel): no enum values, chained subcommand values, suffixes, enums or
+/// chained subcommands; then each command (name, description, flags, permission, no aliases, no chained
+/// subcommands) with one overload taking optional raw text; no dynamic enums or constraints.
+/// shortcut: arguments aren't described (Bedrock completes names only); that needs Java's command graph translated.
+fn available_commands(names: &[String]) -> Vec<u8> {
+    const RAW_TEXT: u32 = 0x10_0000 | 70; // valid argument, raw text (the rest of the line)
+    let names: Vec<_> = (names.iter())
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b)))
+        .collect();
+    let mut w = W::default();
+    w.varuint(0).varuint(0).varuint(0).varuint(0).varuint(0).varuint(names.len() as u32);
+    for name in names {
+        w.string(name).string("").bytes(&0u16.to_le_bytes()).string("any").bytes(&u32::MAX.to_le_bytes()).varuint(0);
+        w.varuint(1).bool(false).varuint(1).string("args").bytes(&RAW_TEXT.to_le_bytes()).bool(true).u8(0);
+    }
+    w.varuint(0).varuint(0);
+    w.0
+}
+
 /// Bedrock's variant number for a Java cat, wolf or frog variant (orders as Geyser's), 0 when unknown.
 fn bedrock_variant(registry: &str, java: &str) -> i32 {
     let order: &[&str] = match registry {
@@ -1943,6 +1973,15 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_list() {
+        assert_eq!(available_commands(&[]), [0; 8], "empty: eight empty lists");
+        let p = available_commands(&["tp".into(), "minecraft:tp".into()]); // namespaced names are left out
+        let mut want = vec![0, 0, 0, 0, 0, 1, 2, b't', b'p', 0, 0, 0, 3, b'a', b'n', b'y', 0xFF, 0xFF, 0xFF, 0xFF, 0];
+        want.extend([1, 0, 1, 4, b'a', b'r', b'g', b's', 70, 0, 0x10, 0, 1, 0, 0, 0]);
+        assert_eq!(p, want);
+    }
 
     #[test]
     fn mob_variants() {

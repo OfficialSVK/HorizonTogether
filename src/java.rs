@@ -363,6 +363,8 @@ pub enum Event {
     Biomes(Vec<u32>),
     /// The enchantment registry's names, in id order.
     Enchantments(Vec<String>),
+    /// The top-level commands the player may run.
+    Commands(Vec<String>),
     /// A mob variant registry (cat, wolf, frog) in id order.
     Variants { registry: String, names: Vec<String> },
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
@@ -605,6 +607,9 @@ fn block_pos(p: [i32; 3]) -> [u8; 8] {
     ((x & 0x3FF_FFFF) << 38 | (z & 0x3FF_FFFF) << 12 | (y & 0xFFF)).to_be_bytes()
 }
 
+/// The command_suggestion transaction id the bridge uses for its own "/" request.
+const COMMANDS_TRANSACTION: i32 = 1;
+
 fn read_block_pos(r: &mut &[u8]) -> io::Result<[i32; 3]> {
     let v = i64::from_be_bytes(take_bytes(r, 8)?.try_into().unwrap());
     Ok([(v >> 38) as i32, (v << 52 >> 52) as i32, (v << 26 >> 38) as i32])
@@ -760,10 +765,13 @@ fn read_nbt_payload(r: &mut &[u8], t: u8, depth: u32) -> io::Result<Nbt> {
         Ok(String::from_utf8_lossy(take_bytes(r, n)?).into_owned())
     };
     Ok(match t {
-        1 => take_bytes(r, 1).map(|_| Nbt::Other)?,
-        2 => take_bytes(r, 2).map(|_| Nbt::Other)?,
-        3 | 5 => take_bytes(r, 4).map(|_| Nbt::Other)?,
-        4 | 6 => take_bytes(r, 8).map(|_| Nbt::Other)?,
+        // Numbers as their text: message arguments ("Gave %s [%s]") can be plain numbers.
+        1 => Nbt::Str((take_bytes(r, 1)?[0] as i8).to_string()),
+        2 => Nbt::Str(i16::from_be_bytes(take_bytes(r, 2)?.try_into().unwrap()).to_string()),
+        3 => Nbt::Str(i32::from_be_bytes(take_bytes(r, 4)?.try_into().unwrap()).to_string()),
+        4 => Nbt::Str(i64::from_be_bytes(take_bytes(r, 8)?.try_into().unwrap()).to_string()),
+        5 => Nbt::Str(f32::from_be_bytes(take_bytes(r, 4)?.try_into().unwrap()).to_string()),
+        6 => Nbt::Str(f64::from_be_bytes(take_bytes(r, 8)?.try_into().unwrap()).to_string()),
         7 => { let n = len(r)?; take_bytes(r, n).map(|_| Nbt::Other)? }
         8 => Nbt::Str(string(r)?),
         9 => {
@@ -797,39 +805,22 @@ fn component_text(c: &Nbt) -> String {
         Nbt::Str(s) => s.clone(),
         Nbt::List(items) => items.iter().map(component_text).collect(),
         Nbt::Compound(f) => {
-            let mut s = match (field(f, "text"), field(f, "translate")) {
+            // A list mixing kinds (a number among components) wraps each element as {"": value}.
+            let mut s = match (field(f, "text").or_else(|| field(f, "")), field(f, "translate")) {
                 (Some(t), _) => component_text(t),
                 (None, Some(Nbt::Str(key))) => {
                     let args: Vec<String> = match field(f, "with") {
                         Some(Nbt::List(a)) => a.iter().map(component_text).collect(),
                         _ => Vec::new(),
                     };
-                    let template = match key.as_str() {
-                        "chat.type.text" => "<%s> %s",
-                        "chat.type.announcement" => "[%s] %s",
-                        "chat.type.emote" => "* %s %s",
-                        "multiplayer.player.joined" => "%s joined the game",
-                        "multiplayer.player.left" => "%s left the game",
-                        "command.unknown.command" => "Unknown or incomplete command, see below for error",
-                        "command.unknown.argument" => "Incorrect argument for command",
-                        "command.context.here" => "<--[HERE]",
-                        "commands.time.set" => "Set the time to %s",
-                        "commands.gamemode.success.self" => "Set own game mode to %s",
-                        "commands.gamemode.success.other" => "Set %s's game mode to %s",
-                        "death.attack.fall" => "%s hit the ground too hard",
-                        "death.fell.accident.generic" => "%s fell from a high place",
-                        "death.attack.generic" => "%s died",
-                        "death.attack.player" | "death.attack.mob" => "%s was slain by %s",
-                        "death.attack.outOfWorld" => "%s fell out of the world",
-                        "death.attack.drown" => "%s drowned",
-                        "death.attack.lava" => "%s tried to swim in lava",
-                        "death.attack.inFire" | "death.attack.onFire" => "%s burned to death",
-                        "death.attack.starve" => "%s starved to death",
-                        "death.attack.genericKill" | "death.attack.kill" => "%s was killed",
-                        // shortcut: other keys show their arguments only; full text needs the language files.
-                        _ => return args.join(" ") + &extra_text(f),
+                    let fallback = match field(f, "fallback") {
+                        Some(Nbt::Str(s)) => Some(s.as_str()),
+                        _ => None,
                     };
-                    args.iter().fold(template.to_string(), |t, a| t.replacen("%s", a, 1))
+                    let Some(template) = java_lang(key).or(fallback).or_else(|| builtin_text(key)) else {
+                        return args.join(" ") + &extra_text(f);
+                    };
+                    format_translation(template, &args)
                 }
                 _ => String::new(),
             };
@@ -838,6 +829,87 @@ fn component_text(c: &Nbt) -> String {
         }
         Nbt::Other => String::new(),
     }
+}
+
+/// Java's "%s" / "%1$s" placeholders filled in ("%%" is a percent sign).
+fn format_translation(template: &str, args: &[String]) -> String {
+    let (mut out, mut next, mut rest) = (String::new(), 0, template);
+    while let Some(i) = rest.find('%') {
+        out += &rest[..i];
+        rest = &rest[i + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if rest.starts_with('%') {
+            out.push('%');
+            rest = &rest[1..];
+        } else if rest.starts_with('s') {
+            out += args.get(next).map_or("", |a| a.as_str());
+            next += 1;
+            rest = &rest[1..];
+        } else if digits > 0 && rest[digits..].starts_with("$s") {
+            let n: usize = rest[..digits].parse().unwrap_or(0);
+            out += args.get(n.wrapping_sub(1)).map_or("", |a| a.as_str());
+            rest = &rest[digits + 2..];
+        } else {
+            out.push('%');
+        }
+    }
+    out + rest
+}
+
+/// Java's English text for a translation key, from the game's language file that Horizon's launcher extracted
+/// (Mojang's, so not in this repo): the file `HORIZON_LANG` names, or the newest under
+/// %APPDATA%\horizon-launcher\versions\*\.local\horizon-client\*\assets\minecraft\lang\en_us.json.
+fn java_lang(key: &str) -> Option<&'static str> {
+    static LANG: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    let lang = LANG.get_or_init(|| {
+        let path = std::env::var_os("HORIZON_LANG").map(std::path::PathBuf::from).or_else(find_lang);
+        let table = path.as_ref().and_then(|p| serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok());
+        match (&path, &table) {
+            (Some(p), Some(_)) => println!("Java: English text from {}", p.display()),
+            _ => eprintln!("Java: no language file found (set HORIZON_LANG); most messages show their arguments only"),
+        }
+        table.unwrap_or_default()
+    });
+    lang.get(key).map(String::as_str)
+}
+
+fn find_lang() -> Option<std::path::PathBuf> {
+    let versions = std::path::PathBuf::from(std::env::var_os("APPDATA")?).join("horizon-launcher").join("versions");
+    let mut found: Vec<_> = (std::fs::read_dir(versions).ok()?.flatten())
+        .filter_map(|v| std::fs::read_dir(v.path().join(".local").join("horizon-client")).ok())
+        .flat_map(|d| d.flatten().map(|d| d.path().join("assets/minecraft/lang/en_us.json")))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .collect();
+    found.sort();
+    found.pop().map(|(_, p)| p)
+}
+
+/// The few messages the bridge can show without the language file.
+fn builtin_text(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "chat.type.text" => "<%s> %s",
+        "chat.type.announcement" => "[%s] %s",
+        "chat.type.emote" => "* %s %s",
+        "multiplayer.player.joined" => "%s joined the game",
+        "multiplayer.player.left" => "%s left the game",
+        "command.unknown.command" => "Unknown or incomplete command, see below for error",
+        "command.unknown.argument" => "Incorrect argument for command",
+        "command.context.here" => "<--[HERE]",
+        "commands.time.set" => "Set the time to %s",
+        "commands.gamemode.success.self" => "Set own game mode to %s",
+        "commands.gamemode.success.other" => "Set %s's game mode to %s",
+        "death.attack.fall" => "%s hit the ground too hard",
+        "death.fell.accident.generic" => "%s fell from a high place",
+        "death.attack.generic" => "%s died",
+        "death.attack.player" | "death.attack.mob" => "%s was slain by %s",
+        "death.attack.outOfWorld" => "%s fell out of the world",
+        "death.attack.drown" => "%s drowned",
+        "death.attack.lava" => "%s tried to swim in lava",
+        "death.attack.inFire" | "death.attack.onFire" => "%s burned to death",
+        "death.attack.starve" => "%s starved to death",
+        "death.attack.genericKill" | "death.attack.kill" => "%s was killed",
+        _ => return None,
+    })
 }
 
 fn extra_text(f: &[(String, Nbt)]) -> String {
@@ -1530,6 +1602,29 @@ pub async fn play(
                     return Ok(());
                 }
             }
+            // commands (the command tree, sent again when permissions change): rather than decode the graph, ask
+            // for completions of "/", which are the top-level commands this player may run.
+            (State::Game, 0x10) => {
+                let mut ask = vec![COMMANDS_TRANSACTION as u8];
+                write_string(&mut ask, "/");
+                c.send(0x0f, &ask).await?;
+            }
+            // command_suggestions: transaction id, start, length, then (match, optional tooltip component).
+            (State::Game, 0x0f) if read_varint_sync(&mut r)? == COMMANDS_TRANSACTION => {
+                read_varint_sync(&mut r)?;
+                read_varint_sync(&mut r)?;
+                let mut names = Vec::new();
+                for _ in 0..read_varint_sync(&mut r)? {
+                    let n = read_varint_sync(&mut r)? as usize;
+                    names.push(String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned());
+                    if take_bytes(&mut r, 1)?[0] != 0 {
+                        read_nbt(&mut r)?;
+                    }
+                }
+                if events.send(Event::Commands(names)).is_err() {
+                    return Ok(());
+                }
+            }
             (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
             (State::Game, 0x3e) => c.send(0x2d, &body).await?, // ping -> pong
             (State::Game, 0x49) => {
@@ -1764,6 +1859,13 @@ mod tests {
     }
 
     #[test]
+    fn fills_translations() {
+        let args = ["3".to_string(), "[Diamond]".into(), "Alex".into()];
+        assert_eq!(format_translation("Gave %s %s to %s", &args), "Gave 3 [Diamond] to Alex");
+        assert_eq!(format_translation("%3$s got %1$s (100%%)", &args), "Alex got 3 (100%)");
+    }
+
+    #[test]
     fn reads_items() {
         assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
         // 64 stone (id 1), no components.
@@ -1876,6 +1978,7 @@ mod tests {
                 Event::Biomes(b) => println!("{} biomes: {b:?}", b.len()),
                 Event::Enchantments(e) => println!("{} enchantments: {e:?}", e.len()),
                 Event::Variants { registry, names } => println!("{registry}: {names:?}"),
+                Event::Commands(names) => println!("{} commands: {names:?}", names.len()),
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
