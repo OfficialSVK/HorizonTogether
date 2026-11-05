@@ -263,15 +263,37 @@ pub fn inventory_to_menu(i: u8) -> i16 {
     }
 }
 
-/// An item stack as a Java client writes it: count, then id and an empty component patch.
+/// An item stack as a Java client writes it in set_creative_mode_slot: count, id, then the component patch
+/// with each value length-prefixed (damage, enchantments; nothing removed).
 fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
-    match item {
-        Some(i) if i.count > 0 => {
-            write_varint(out, i.count as i32);
-            write_varint(out, i.id);
-            out.extend([0, 0]); // no components added or removed
+    let Some(i) = item.filter(|i| i.count > 0) else {
+        out.push(0);
+        return;
+    };
+    write_varint(out, i.count as i32);
+    write_varint(out, i.id);
+    let mut added: Vec<(i32, Vec<u8>)> = Vec::new();
+    if i.damage > 0 {
+        let mut v = Vec::new();
+        write_varint(&mut v, i.damage as i32);
+        added.push((3, v));
+    }
+    let ench: Vec<_> = i.ench.iter().filter(|e| e.1 > 0).collect();
+    if !ench.is_empty() {
+        let mut v = Vec::new();
+        write_varint(&mut v, ench.len() as i32);
+        for (id, level) in ench {
+            write_varint(&mut v, *id as i32);
+            write_varint(&mut v, *level as i32);
         }
-        _ => out.push(0),
+        added.push((13, v));
+    }
+    write_varint(out, added.len() as i32);
+    write_varint(out, 0); // none removed
+    for (kind, value) in added {
+        write_varint(out, kind);
+        write_varint(out, value.len() as i32);
+        out.extend(value);
     }
 }
 
@@ -335,17 +357,29 @@ pub enum Event {
     CloseContainer(i32),
     /// The Bedrock biome id of each Java biome id (from the biome registry), for chunk translation.
     Biomes(Vec<u32>),
+    /// The enchantment registry's names, in id order.
+    Enchantments(Vec<String>),
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
     Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
 }
 
-/// A Java item stack. shortcut: data components are read past, not kept (no damage, names or enchantments on
-/// Bedrock yet).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A Java item stack: its id, count, damage and enchantments. shortcut: other data components (custom names,
+/// lore, dyes...) are read past and not kept, so they don't reach Bedrock or survive a creative-mode move.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct Item {
     pub id: i32,
     pub count: u8,
+    /// Damage taken (the damage component); 0 when none.
+    pub damage: u16,
+    /// Up to four enchantments (or a book's stored ones): (Java enchantment registry id, level); level 0 is empty.
+    pub ench: [(u8, u8); 4],
+}
+
+impl Item {
+    pub fn new(id: i32, count: u8) -> Self {
+        Item { id, count, ..Default::default() }
+    }
 }
 
 /// Java item stack: count, then item id and data-component patch (added, then removed component types).
@@ -356,20 +390,32 @@ fn read_item(r: &mut &[u8]) -> io::Result<Option<Item>> {
         return Ok(None);
     }
     let id = read_varint_sync(r)?;
+    let mut item = Item::new(id, count.min(255) as u8);
     let (added, removed) = (read_varint_sync(r)?, read_varint_sync(r)?);
     for _ in 0..added {
-        skip_component(r)?;
+        read_component(r, &mut item)?;
     }
     for _ in 0..removed {
         read_varint_sync(r)?;
     }
-    Ok(Some(Item { id, count: count.min(255) as u8 }))
+    Ok(Some(item))
 }
 
-/// Skips one added data component (type id, then value). Ids from the 26.3 data_component_type registry.
-fn skip_component(r: &mut &[u8]) -> io::Result<()> {
+/// Reads one added data component (type id, then value), keeping damage and enchantments. Ids from the 26.3
+/// data_component_type registry.
+fn read_component(r: &mut &[u8], item: &mut Item) -> io::Result<()> {
     match read_varint_sync(r)? {
-        1 | 2 | 3 | 12 | 19 | 48 => drop(read_varint_sync(r)?), // max stack size, max damage, damage, rarity, repair cost, map id
+        3 => item.damage = read_varint_sync(r)?.clamp(0, u16::MAX as i32) as u16,
+        13 | 45 => {
+            // enchantments / stored enchantments: (enchantment id, level) pairs
+            for _ in 0..read_varint_sync(r)? {
+                let (id, level) = (read_varint_sync(r)?, read_varint_sync(r)?);
+                if let Some(free) = item.ench.iter_mut().find(|e| e.1 == 0) {
+                    *free = (id.clamp(0, 255) as u8, level.clamp(1, 255) as u8);
+                }
+            }
+        }
+        1 | 2 | 12 | 19 | 48 => drop(read_varint_sync(r)?), // max stack size, max damage, rarity, repair cost, map id
         4 | 20 | 22 | 120 => {}                                    // unbreakable, creative slot lock, intangible projectile, waxed
         0 | 6 | 9 => drop(read_nbt(r)?),                           // custom data, custom name, item name
         10 => {
@@ -379,12 +425,6 @@ fn skip_component(r: &mut &[u8]) -> io::Result<()> {
         11 => {
             for _ in 0..read_varint_sync(r)? {
                 read_nbt(r)?; // lore lines
-            }
-        }
-        13 | 45 => {
-            for _ in 0..read_varint_sync(r)? {
-                read_varint_sync(r)?; // enchantment
-                read_varint_sync(r)?; // level
             }
         }
         21 => drop(take_bytes(r, 1)?), // enchantment glint override
@@ -1034,7 +1074,21 @@ pub async fn play(
                 // registry_data: registry name, then entries (name, optional NBT). The biome registry's order
                 // gives the biome ids chunks use.
                 let n = read_varint_sync(&mut r)? as usize;
-                if take_bytes(&mut r, n)? == b"minecraft:worldgen/biome" {
+                let registry = take_bytes(&mut r, n)?;
+                if registry == b"minecraft:enchantment" {
+                    let mut enchantments = Vec::new();
+                    for _ in 0..read_varint_sync(&mut r)? {
+                        let n = read_varint_sync(&mut r)? as usize;
+                        let name = String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned();
+                        if take_bytes(&mut r, 1)?[0] != 0 {
+                            read_nbt(&mut r)?;
+                        }
+                        enchantments.push(name);
+                    }
+                    if events.send(Event::Enchantments(enchantments)).is_err() {
+                        return Ok(());
+                    }
+                } else if registry == b"minecraft:worldgen/biome" {
                     let mut biomes = Vec::new();
                     for _ in 0..read_varint_sync(&mut r)? {
                         let n = read_varint_sync(&mut r)? as usize;
@@ -1681,11 +1735,18 @@ mod tests {
     fn reads_items() {
         assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
         // 64 stone (id 1), no components.
-        assert_eq!(read_item(&mut &[64, 1, 0, 0][..]).unwrap(), Some(Item { id: 1, count: 64 }));
+        assert_eq!(read_item(&mut &[64, 1, 0, 0][..]).unwrap(), Some(Item::new(1, 64)));
         // A damaged tool: damage (3) = 5 added, max stack size (1) removed; then the next slot's byte is left.
         let mut r = &[1, 0x8b, 0x07, 1, 1, 3, 5, 1, 9][..];
-        assert_eq!(read_item(&mut r).unwrap(), Some(Item { id: 907, count: 1 }));
+        assert_eq!(read_item(&mut r).unwrap(), Some(Item { damage: 5, ..Item::new(907, 1) }));
         assert_eq!(r, [9]);
+        // Sharpness (id 13) III via the enchantments component (13: count, then id and level pairs).
+        let sword = read_item(&mut &[1, 1, 1, 0, 13, 1, 13, 3][..]).unwrap().unwrap();
+        assert_eq!(sword.ench[0], (13, 3));
+        // Written back, the components are length-prefixed (Horizon reads them that way from the creative menu).
+        let mut out = Vec::new();
+        write_item(&mut out, Some(sword));
+        assert_eq!(out, [1, 1, 1, 0, 13, 3, 1, 13, 3]);
         assert!(read_item(&mut &[1, 1, 1, 0, 99, 0][..]).is_err(), "unknown component");
         assert_eq!((menu_to_inventory(36), menu_to_inventory(5), menu_to_inventory(45), menu_to_inventory(0)), (Some(0), Some(39), Some(40), None));
     }
@@ -1760,7 +1821,7 @@ mod tests {
             }
             let _ = cmd_tx.send(Command::Chat("hello from the bridge test".into()));
             // In creative, a creative-slot edit comes back as the slot's new content (hotbar slot 0 = menu 36).
-            let _ = cmd_tx.send(Command::CreativeSlot { slot: 36, item: Some(Item { id: 1, count: 5 }) });
+            let _ = cmd_tx.send(Command::CreativeSlot { slot: 36, item: Some(Item::new(1, 5)) });
         });
         let r = tokio::time::timeout(Duration::from_secs(8), play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx)).await;
         assert!(r.is_err(), "still connected after 8 s (expected); ended early with {r:?}");
@@ -1781,6 +1842,7 @@ mod tests {
                 Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
                 Event::OpenContainer { window, menu, size } => println!("container {window}: menu {menu}, {size} slots"),
                 Event::Biomes(b) => println!("{} biomes: {b:?}", b.len()),
+                Event::Enchantments(e) => println!("{} enchantments: {e:?}", e.len()),
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),

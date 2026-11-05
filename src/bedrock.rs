@@ -152,6 +152,8 @@ pub struct Session {
     biomes: Vec<u32>,
     /// The sign the player is writing on (Horizon opened its editor): position, front side.
     editing: Option<([i32; 3], bool)>,
+    /// Bedrock enchantment id per Java enchantment id (Horizon's registry); -1 when Bedrock has none.
+    enchants: Vec<i16>,
 }
 
 impl Default for Session {
@@ -189,6 +191,7 @@ impl Default for Session {
             craft: [None; 4],
             biomes: Vec::new(),
             editing: None,
+            enchants: Vec::new(),
         }
     }
 }
@@ -610,7 +613,7 @@ impl Session {
                 let rid = entity_id(id);
                 let mut w = W::default();
                 w.varint64(rid as i64).varuint64(rid);
-                write_stack(&mut w, Some(item), None);
+                write_stack(&mut w, Some(item), None, &self.enchants);
                 w.f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32).f32(0.0).f32(0.0).f32(0.0); // position, velocity
                 // Metadata as for mobs, with an item's box: without a scale the item isn't drawn.
                 w.varuint(4);
@@ -774,7 +777,7 @@ impl Session {
                 w.varuint(bedrock_window as u32).varuint(slots.len() as u32);
                 for item in slots {
                     self.net_id += 1;
-                    write_stack(&mut w, item, Some(self.net_id));
+                    write_stack(&mut w, item, Some(self.net_id), &self.enchants);
                 }
                 w.u8(0).bool(false).bytes(&[0; 8]); // container name, no dynamic id, no storage item
                 packets.push(packet_bytes(INVENTORY_CONTENT, &w.0));
@@ -792,7 +795,7 @@ impl Session {
                 let mut w = W::default();
                 w.varuint(bedrock_window as u32).varuint(slot as u32).bool(false).bool(false);
                 self.net_id += 1;
-                write_stack(&mut w, item, Some(self.net_id));
+                write_stack(&mut w, item, Some(self.net_id), &self.enchants);
                 packets.push(packet_bytes(INVENTORY_SLOT, &w.0));
             }
             crate::java::Event::ContainerData { window, key, value } => {
@@ -843,7 +846,7 @@ impl Session {
                     // MobEquipment: runtime id, item, inventory slot, hotbar slot, window (0 inventory, 119 offhand).
                     let mut w = W::default();
                     w.varuint64(rid);
-                    write_stack(&mut w, item, None);
+                    write_stack(&mut w, item, None, &self.enchants);
                     w.u8(0).u8(0).u8(if slot == 0 { 0 } else { OFFHAND as u8 });
                     out.push(packet_bytes(MOB_EQUIPMENT, &w.0));
                 }
@@ -852,7 +855,7 @@ impl Session {
                     let mut w = W::default();
                     w.varuint64(rid);
                     for s in [5, 4, 3, 2] {
-                        write_stack(&mut w, worn[s], None);
+                        write_stack(&mut w, worn[s], None, &self.enchants);
                     }
                     w.bytes(&[0; 8]);
                     out.push(packet_bytes(MOB_ARMOR_EQUIPMENT, &w.0));
@@ -878,6 +881,7 @@ impl Session {
                 if self.spawned { packets.extend(p) } else { self.pending.extend(p) }
             }
             crate::java::Event::Biomes(biomes) => self.biomes = biomes,
+            crate::java::Event::Enchantments(names) => self.enchants = names.iter().map(|n| bedrock_enchantment(n)).collect(),
             crate::java::Event::Sign(s) => {
                 let p = block_actor_data(s.pos, &crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -927,7 +931,7 @@ impl Session {
             let slots: Vec<u8> = if container == ARMOR { range.rev().collect() } else { range.collect() };
             for i in slots {
                 self.net_id += 1;
-                write_stack(&mut w, self.inventory[i as usize], Some(self.net_id));
+                write_stack(&mut w, self.inventory[i as usize], Some(self.net_id), &self.enchants);
             }
             w.u8(0).bool(false).bytes(&[0; 8]); // container name (as Mojang's server), no dynamic id, no storage item
             out.push(packet_bytes(INVENTORY_CONTENT, &w.0));
@@ -947,7 +951,7 @@ impl Session {
         // Unlike InventoryContent, the container name and storage item are optional here: absent.
         w.varuint(container).varuint(slot).bool(false).bool(false);
         self.net_id += 1;
-        write_stack(&mut w, self.inventory[i as usize], Some(self.net_id));
+        write_stack(&mut w, self.inventory[i as usize], Some(self.net_id), &self.enchants);
         packet_bytes(INVENTORY_SLOT, &w.0)
     }
 
@@ -1568,8 +1572,24 @@ fn read_stack(r: &mut &[u8]) -> Result<(i16, u16), String> {
 /// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
 const SHIELD: i16 = 358;
 
-/// A Java item as a Bedrock NetworkItemStackDescriptor; inventory stacks carry a stack net id.
-fn write_stack(w: &mut W, item: Option<crate::java::Item>, net_id: Option<i32>) {
+/// Bedrock's enchantment ids, in order (protection = 0 ... breach = 40), by Java name.
+const ENCHANTMENTS: [&str; 41] = [
+    "protection", "fire_protection", "feather_falling", "blast_protection", "projectile_protection", "thorns",
+    "respiration", "depth_strider", "aqua_affinity", "sharpness", "smite", "bane_of_arthropods", "knockback",
+    "fire_aspect", "looting", "efficiency", "silk_touch", "unbreaking", "fortune", "power", "punch", "flame",
+    "infinity", "luck_of_the_sea", "lure", "frost_walker", "mending", "binding_curse", "vanishing_curse", "impaling",
+    "riptide", "loyalty", "channeling", "multishot", "piercing", "quick_charge", "soul_speed", "swift_sneak",
+    "wind_burst", "density", "breach",
+];
+
+fn bedrock_enchantment(java: &str) -> i16 {
+    let name = java.strip_prefix("minecraft:").unwrap_or(java);
+    ENCHANTMENTS.iter().position(|e| *e == name).map_or(-1, |i| i as i16)
+}
+
+/// A Java item as a Bedrock NetworkItemStackDescriptor; inventory stacks carry a stack net id. `enchants` maps
+/// Java enchantment ids to Bedrock ones (Session::enchants).
+fn write_stack(w: &mut W, item: Option<crate::java::Item>, net_id: Option<i32>, enchants: &[i16]) {
     let Some((item, (id, aux, block))) = item.and_then(|i| Some((i, crate::world::java_item(i.id)?))) else {
         w.bytes(&[0; 8]); // empty
         return;
@@ -1580,9 +1600,45 @@ fn write_stack(w: &mut W, item: Option<crate::java::Item>, net_id: Option<i32>) 
         None => w.bool(false),
     };
     w.varuint(block);
-    // User data: no NBT, no can-place-on / can-destroy lists (and a blocking tick for shields).
-    let len = if id == SHIELD { 18 } else { 10 };
-    w.varuint(len).bytes(&[0; 18][..len as usize]);
+    // User data: NBT (marker -1, version 1, little-endian NBT) when the item has any, then empty
+    // can-place-on / can-destroy lists (and a blocking tick for shields).
+    let ench: Vec<(i16, u8)> = (item.ench.iter().filter(|e| e.1 > 0))
+        .filter_map(|e| Some((*enchants.get(e.0 as usize).filter(|b| **b >= 0)?, e.1)))
+        .collect();
+    let mut data = Vec::new();
+    if item.damage > 0 || !ench.is_empty() {
+        let tag = |d: &mut Vec<u8>, kind: u8, name: &str| {
+            d.push(kind);
+            d.extend((name.len() as u16).to_le_bytes());
+            d.extend(name.as_bytes());
+        };
+        data.extend([0xFF, 0xFF, 1]);
+        tag(&mut data, 10, "");
+        if item.damage > 0 {
+            tag(&mut data, 3, "Damage");
+            data.extend((item.damage as i32).to_le_bytes());
+        }
+        if !ench.is_empty() {
+            tag(&mut data, 9, "ench");
+            data.push(10);
+            data.extend((ench.len() as i32).to_le_bytes());
+            for (id, level) in ench {
+                tag(&mut data, 2, "id");
+                data.extend(id.to_le_bytes());
+                tag(&mut data, 2, "lvl");
+                data.extend((level as i16).to_le_bytes());
+                data.push(0);
+            }
+        }
+        data.push(0);
+    } else {
+        data.extend([0, 0]);
+    }
+    data.extend([0; 8]);
+    if id == SHIELD {
+        data.extend([0; 8]);
+    }
+    w.varuint(data.len() as u32).bytes(&data);
 }
 
 struct ItemUse {
@@ -1729,6 +1785,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stacks_carry_damage_and_enchantments() {
+        let enchants = ["minecraft:lunge", "minecraft:sharpness"].map(bedrock_enchantment);
+        assert_eq!(enchants, [-1, 9]);
+        let mut sword = crate::java::Item::new(1, 1); // any mapped item
+        sword.damage = 5;
+        sword.ench[0] = (1, 3); // sharpness III
+        sword.ench[1] = (0, 1); // lunge: no Bedrock equivalent, dropped
+        let mut w = W::default();
+        write_stack(&mut w, Some(sword), None, &enchants);
+        let nbt: Vec<u8> = [&[0xFF, 0xFF, 1, 10, 0, 0][..], &[3, 6, 0], b"Damage", &[5, 0, 0, 0], &[9, 4, 0], b"ench",
+            &[10, 1, 0, 0, 0, 2, 2, 0], b"id", &[9, 0, 2, 3, 0], b"lvl", &[3, 0, 0, 0], &[0; 8]]
+            .concat();
+        assert!(w.0.ends_with(&nbt), "{:?}", w.0);
+        assert_eq!(w.0[w.0.len() - nbt.len() - 1] as usize, nbt.len()); // length prefix
+        let mut plain = W::default();
+        write_stack(&mut plain, Some(crate::java::Item::new(1, 1)), None, &enchants);
+        assert!(plain.0.ends_with(&[10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+    }
+
+    #[test]
     fn reads_block_actions_after_an_item_use() {
         let mut p = vec![0, 0, 0]; // input mode, play mode, interaction model
         p.extend([0; 8]); // interact rotation
@@ -1778,7 +1854,7 @@ mod tests {
         let open = s.on_message(&[4, INTERACT as u8, 6, 1, 0]).unwrap();
         // One batch: ContainerOpen, window 0, type -1, block (1, 70, -3) zigzag, unique id 1 (zigzag 2).
         assert_eq!(open, [vec![8, CONTAINER_OPEN as u8, 0, 0xFF, 2, 140, 1, 5, 2]]);
-        s.cursor = Some(crate::java::Item { id: 1, count: 3 }); // left on the cursor when the screen closes
+        s.cursor = Some(crate::java::Item::new(1, 3)); // left on the cursor when the screen closes
         let close = s.on_message(&[4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]).unwrap();
         assert_eq!(s.cursor, None, "Bedrock puts the cursor's items back");
         assert_eq!(close, [vec![4, CONTAINER_CLOSE as u8, 0, 0xFF, 0]]);
@@ -1828,7 +1904,7 @@ mod tests {
         assert!(s.on_java(Event::AddEntity { id: 10, kind: 85, pos: [0.0; 3], yaw: 0.0, pitch: 0.0, head_yaw: 0.0 }).is_empty());
         assert!(s.on_java(Event::MoveEntity { id: 10, pos: [0.0; 3], yaw: 0.0, pitch: 0.0, head_yaw: 0.0 }).is_empty());
         // A dropped item: AddItemActor, then picked up by us.
-        let item = s.on_java(Event::AddItem { id: 11, item: Item { id: 1, count: 3 }, pos: [0.0, 65.0, 0.0] });
+        let item = s.on_java(Event::AddItem { id: 11, item: Item::new(1, 3), pos: [0.0, 65.0, 0.0] });
         assert_eq!(ids(item), [ADD_ITEM_ACTOR]);
         assert_eq!(ids(s.on_java(Event::TakeItem { item: 11, collector: None })), [TAKE_ITEM_ACTOR]);
     }
@@ -1838,7 +1914,7 @@ mod tests {
         use crate::java::{Event, Item};
         let mut s = Session { spawned: true, ..Default::default() };
         s.shown.insert(5, Shown::Player);
-        let stone = Some(Item { id: 1, count: 1 });
+        let stone = Some(Item::new(1, 1));
         let held = s.on_java(Event::Equipment { id: 5, slots: vec![(0, stone)] });
         // MobEquipment for runtime id 7 (Java 5 + 2): the stack without a net id, then slots and window 0.
         let mut want = vec![MOB_EQUIPMENT as u8, 7, 1, 0, 1, 0, 0, 0];
@@ -1859,7 +1935,7 @@ mod tests {
     #[test]
     fn inventory_slot_layout() {
         let mut s = Session::default();
-        s.inventory[0] = Some(crate::java::Item { id: 1, count: 64 }); // stone
+        s.inventory[0] = Some(crate::java::Item::new(1, 64)); // stone
         let p = s.inventory_slot(0);
         // id, container 0, slot 0, no container name, no storage item, then the stack: item 1 (i16), count 64 (u16),
         // aux 0, has net id, net id 1 (zigzag), block id, user data (10 bytes).

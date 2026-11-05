@@ -375,7 +375,7 @@ impl Session {
                             }
                         }
                     }
-                    self.set(to, Some(Item { id: s.id, count: d.map_or(0, |d| d.count) + count }));
+                    self.set(to, Some(Item { count: d.map_or(0, |d| d.count) + count, ..s })); // keeps damage, enchantments
                     self.set(from, Some(Item { count: s.count - count, ..s }));
                     touched.extend([src, dst]);
                 }
@@ -422,12 +422,12 @@ impl Session {
                 Action::Ignored => {}
                 Action::CraftCreative(id) if creative => {
                     let java_id = crate::world::creative_java(id).ok_or(format!("creative item {id} unknown"))?;
-                    self.created = Some(Item { id: java_id, count: 255 });
+                    self.created = Some(Item::new(java_id, 255));
                     self.crafted = false;
                 }
                 Action::CraftRecipe { id, times } => {
                     let (java_id, count) = crate::world::recipe_output(id).ok_or(format!("recipe {id} unknown"))?;
-                    self.created = Some(Item { id: java_id, count: count.saturating_mul(times.max(1)) });
+                    self.created = Some(Item::new(java_id, count.saturating_mul(times.max(1))));
                     (self.crafted, self.recipe) = (true, id);
                 }
                 // The grid's items: Horizon uses them up itself when the result is taken.
@@ -526,7 +526,7 @@ mod tests {
         let mut actions = reqs.into_iter().next().unwrap().actions;
         actions.push(place_in_hotbar);
         let (touched, java) = s.apply(&actions).unwrap();
-        assert_eq!(s.inventory[2], Some(Item { id: planks, count: 64 }));
+        assert_eq!(s.inventory[2], Some(Item::new(planks, 64)));
         assert_eq!(s.cursor, None);
         assert_eq!(touched.len(), 3, "cursor twice and the hotbar slot; not the creative output");
         assert_eq!(java.len(), 1);
@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn survival_moves_are_java_clicks() {
         let mut s = Session { game_mode: 0, ..Default::default() };
-        s.inventory[0] = Some(Item { id: 1, count: 10 });
+        s.inventory[0] = Some(Item::new(1, 10));
         let hotbar0 = SlotRef { container: HOTBAR, slot: 0 };
         let cursor = SlotRef { container: CURSOR, slot: 0 };
         let main9 = SlotRef { container: INVENTORY, slot: 9 };
@@ -565,7 +565,7 @@ mod tests {
         let mut s = Session { game_mode: 1, ..Default::default() }; // crafting is clicks even in creative
         let planks = crate::world::creative_java(1).unwrap(); // oak planks
         let recipe = (1..4000).find(|&n| crate::world::recipe_output(n).is_some_and(|(id, c)| id == planks && c == 4)).unwrap();
-        s.inventory[0] = Some(Item { id: 9999, count: 1 }); // a log (any id: Horizon checks the recipe, not the bridge)
+        s.inventory[0] = Some(Item::new(9999, 1)); // a log (any id: Horizon checks the recipe, not the bridge)
         let (hotbar0, cursor) = (SlotRef { container: HOTBAR, slot: 0 }, SlotRef { container: CURSOR, slot: 0 });
         let grid0 = SlotRef { container: CRAFTING_INPUT, slot: 28 };
         let output = SlotRef { container: CREATED, slot: 50 };
@@ -583,7 +583,7 @@ mod tests {
         ];
         let (touched, java) = s.apply(&craft).unwrap();
         assert_eq!(clicks(&java), [(0, 0, 0)]);
-        assert_eq!((s.craft[0], s.cursor), (None, Some(Item { id: planks, count: 4 })));
+        assert_eq!((s.craft[0], s.cursor), (None, Some(Item::new(planks, 4))));
         assert_eq!(touched, [grid0, cursor]);
     }
 
@@ -591,14 +591,14 @@ mod tests {
     fn chest_moves_are_clicks_in_its_window() {
         let mut s = Session { game_mode: 1, ..Default::default() }; // creative too: a container needs clicks
         s.open = Some(Open { window: 3, java_window: 3, kind: 0, slots: vec![None; 27], furnace: false });
-        s.inventory[0] = Some(Item { id: 1, count: 64 });
+        s.inventory[0] = Some(Item::new(1, 64));
         let hotbar0 = SlotRef { container: HOTBAR, slot: 0 };
         let chest5 = SlotRef { container: LEVEL_ENTITY, slot: 5 };
         // Shift-click style move of the whole stack: pick up hotbar 0 (Java slot 27 + 27 + 0 = 54), put in chest 5.
         let (touched, java) = s.apply(&[Action::Move { count: 64, src: hotbar0, dst: chest5 }]).unwrap();
         let clicks: Vec<_> = java.iter().map(|c| match c { Command::Click { window: 3, slot, button, .. } => (*slot, *button), _ => panic!() }).collect();
         assert_eq!(clicks, [(54, 0), (5, 0)]);
-        assert_eq!((s.inventory[0], s.open.as_ref().unwrap().slots[5]), (None, Some(Item { id: 1, count: 64 })));
+        assert_eq!((s.inventory[0], s.open.as_ref().unwrap().slots[5]), (None, Some(Item::new(1, 64))));
         assert_eq!(touched, [hotbar0, chest5]);
         // Main inventory slot 9 is Java menu slot 27 in a 27-slot chest; armor has no slot there.
         assert_eq!(s.menu_slot(Place::Inv(9)), Some(27));
