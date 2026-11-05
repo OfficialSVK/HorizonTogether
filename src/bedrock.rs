@@ -46,6 +46,7 @@ const VOXEL_SHAPES: u32 = 337;
 const PLAYER_AUTH_INPUT: u32 = 144;
 const UPDATE_BLOCK: u32 = 21;
 const LEVEL_EVENT: u32 = 25;
+const LEVEL_SOUND_EVENT: u32 = 123;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -159,6 +160,9 @@ pub struct Session {
     chunks: std::collections::HashMap<(i32, i32), Vec<u8>>,
     changed: std::collections::HashMap<[i32; 3], u32>,
     on_ground: bool,
+    /// The block a click may place and when: Horizon's block there plays Bedrock's place sound.
+    /// shortcut: placing into a replaceable block (tall grass) changes the clicked block instead, and stays silent.
+    placing: Option<([i32; 3], std::time::Instant)>,
 }
 
 impl Default for Session {
@@ -200,6 +204,7 @@ impl Default for Session {
             chunks: Default::default(),
             changed: Default::default(),
             on_ground: true,
+            placing: None,
         }
     }
 }
@@ -596,6 +601,7 @@ impl Session {
             crate::java::Event::GameMode(mode) => {
                 println!("Bedrock: Horizon game mode {mode}");
                 self.game_mode = mode;
+                self.breaking = None; // a creative break's leftover would block a survival start
                 if self.spawned {
                     packets.push(packet_bytes(SET_PLAYER_GAME_TYPE, &W::default().varint(bedrock_game_mode(mode)).0));
                     packets.push(packet_bytes(UPDATE_ABILITIES, &abilities(mode)));
@@ -885,11 +891,18 @@ impl Session {
             }
             crate::java::Event::Block { pos, state } => {
                 self.changed.insert(pos, state);
+                if self.game_mode == 1 && state != 0 && self.breaking == Some(pos) {
+                    self.breaking = None; // a block again: creative can break it again
+                }
                 // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
                 let mut w = W::default();
                 w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
                 w.varuint(3).varuint(0); // flags: neighbours + network; layer 0
                 let mut p = vec![packet_bytes(UPDATE_BLOCK, &w.0)];
+                // The block the player just placed: Bedrock waits for the server's place sound.
+                if state != 0 && self.placing.take_if(|(at, t)| *at == pos && t.elapsed().as_secs() < 2).is_some() {
+                    p.push(place_sound(pos, state));
+                }
                 // A chest's pairing (a second chest placed beside it changes both): its block entity data.
                 if let Some(nbt) = crate::world::chest_nbt(pos, state) {
                     p.push(block_actor_data(pos, &nbt));
@@ -996,6 +1009,9 @@ impl Session {
                 self.to_java.push(crate::java::Command::HeldSlot(slot));
             }
             self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
+            // Where a placed block would go (faces: down, up, north, south, west, east), for its place sound.
+            let [dx, dy, dz] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face as usize];
+            self.placing = Some(([u.pos[0] + dx, u.pos[1] + dy, u.pos[2] + dz], std::time::Instant::now()));
         }
     }
 
@@ -1019,6 +1035,14 @@ impl Session {
         use crate::java::{DIG_ABORT, DIG_FINISH, DIG_START};
         let mut cracks = Vec::new();
         let (status, pos) = match action {
+            // Creative: Bedrock sends "creative destroy" and then "start" or "continue" for one break; Java breaks on
+            // "start", once. `breaking` holds the broken block until Horizon puts something there again.
+            START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK | CREATIVE_DESTROY_BLOCK | PREDICT_DESTROY_BLOCK if self.game_mode == 1 => {
+                if self.breaking.replace(pos) == Some(pos) {
+                    return cracks;
+                }
+                (DIG_START, pos)
+            }
             // "Continue" repeats every tick while the button is held: only a new block restarts Java's dig timer.
             START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK if self.breaking == Some(pos) => return cracks,
             START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK => {
@@ -1035,12 +1059,6 @@ impl Session {
             // Survival break of a block never started (instant-break blocks): Java breaks those on "start".
             PREDICT_DESTROY_BLOCK if self.game_mode != 1 && self.breaking != Some(pos) => {
                 self.breaking = None;
-                (DIG_START, pos)
-            }
-            CREATIVE_DESTROY_BLOCK | PREDICT_DESTROY_BLOCK if self.game_mode == 1 => {
-                if self.breaking.take() == Some(pos) {
-                    return cracks; // already broken by "start"
-                }
                 (DIG_START, pos)
             }
             PREDICT_DESTROY_BLOCK => {
@@ -1394,6 +1412,16 @@ fn destroyed(pos: [i32; 3], java_state: u32) -> Vec<u8> {
     w.varint(2001).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
     w.varint(crate::world::java_block(java_state) as i32);
     packet_bytes(LEVEL_EVENT, &w.0)
+}
+
+/// LevelSoundEvent "place" for a block (layout from gophertunnel): sound name, position, extra data (the Bedrock
+/// block id), entity type, baby, disable relative volume, source entity (i64 LE, none), no fire-at position.
+fn place_sound(pos: [i32; 3], java_state: u32) -> Vec<u8> {
+    let mut w = W::default();
+    w.string("place").f32(pos[0] as f32 + 0.5).f32(pos[1] as f32 + 0.5).f32(pos[2] as f32 + 0.5);
+    w.varint(crate::world::java_block(java_state) as i32).string(":").bool(false).bool(false);
+    w.bytes(&(-1i64).to_le_bytes()).bool(false);
+    packet_bytes(LEVEL_SOUND_EVENT, &w.0)
 }
 
 /// LevelEvent starting (strength 0..1 scaled to 0..65535) or stopping rain or thunder. Event ids from gophertunnel:
