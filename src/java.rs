@@ -363,6 +363,8 @@ pub enum Event {
     Biomes(Vec<u32>),
     /// The enchantment registry's names, in id order.
     Enchantments(Vec<String>),
+    /// A mob variant registry (cat, wolf, frog) in id order.
+    Variants { registry: String, names: Vec<String> },
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
     Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
@@ -493,6 +495,8 @@ pub enum Data {
     Bool(bool),
     /// A text component (custom name), `None` when absent.
     Text(Option<String>),
+    /// A registry id: the cat, cow, wolf, frog, pig and chicken variants (and their sound variants).
+    Id(i32),
     /// A value of another type, read past.
     Other,
 }
@@ -511,8 +515,10 @@ fn read_entity_data(mut r: &[u8]) -> Vec<(u8, Data)> {
             8 => Data::Bool(take_bytes(&mut r, 1)?[0] != 0),
             5 => Data::Text(Some(component_text(&read_nbt(&mut r)?))),
             6 => Data::Text(if take_bytes(&mut r, 1)?[0] != 0 { Some(component_text(&read_nbt(&mut r)?)) } else { None }),
-            // Read past: int and pose, long, float, string, item stack.
-            1 | 20 => read_varint_sync(&mut r).map(|_| Data::Other)?,
+            21..=32 => Data::Id(read_varint_sync(&mut r)?),
+            // Read past: int, direction, block states, optional int, pose, painting variant to weathering state,
+            // arm and dye; long, float, string, item stack.
+            1 | 12 | 14 | 15 | 19 | 20 | 34..=38 | 42 | 43 => read_varint_sync(&mut r).map(|_| Data::Other)?,
             2 => read_varlong(&mut r).map(|_| Data::Other)?,
             3 => take_bytes(&mut r, 4).map(|_| Data::Other)?,
             4 => {
@@ -1091,6 +1097,19 @@ pub async fn play(
                         enchantments.push(name);
                     }
                     if events.send(Event::Enchantments(enchantments)).is_err() {
+                        return Ok(());
+                    }
+                } else if [&b"minecraft:cat_variant"[..], b"minecraft:wolf_variant", b"minecraft:frog_variant"].contains(&registry) {
+                    let registry = String::from_utf8_lossy(registry).into_owned();
+                    let mut names = Vec::new();
+                    for _ in 0..read_varint_sync(&mut r)? {
+                        let n = read_varint_sync(&mut r)? as usize;
+                        names.push(String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned());
+                        if take_bytes(&mut r, 1)?[0] != 0 {
+                            read_nbt(&mut r)?;
+                        }
+                    }
+                    if events.send(Event::Variants { registry, names }).is_err() {
                         return Ok(());
                     }
                 } else if registry == b"minecraft:worldgen/biome" {
@@ -1856,6 +1875,7 @@ mod tests {
                 Event::OpenContainer { window, menu, size } => println!("container {window}: menu {menu}, {size} slots"),
                 Event::Biomes(b) => println!("{} biomes: {b:?}", b.len()),
                 Event::Enchantments(e) => println!("{} enchantments: {e:?}", e.len()),
+                Event::Variants { registry, names } => println!("{registry}: {names:?}"),
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),

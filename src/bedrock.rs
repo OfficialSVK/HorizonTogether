@@ -164,6 +164,8 @@ pub struct Session {
     /// The block a click may place and when: Horizon's block there plays Bedrock's place sound.
     /// shortcut: placing into a replaceable block (tall grass) changes the clicked block instead, and stays silent.
     placing: Option<([i32; 3], std::time::Instant)>,
+    /// Bedrock variant per Java registry id, by registry (cat, wolf, frog variants).
+    variants: std::collections::HashMap<String, Vec<i32>>,
 }
 
 impl Default for Session {
@@ -206,6 +208,7 @@ impl Default for Session {
             changed: Default::default(),
             on_ground: true,
             placing: None,
+            variants: Default::default(),
         }
     }
 }
@@ -723,6 +726,19 @@ impl Session {
                             e.meta(3, 0).u8(w & 15);
                             entries.insert(3, e.0);
                         }
+                        // Cat (20), wolf (23) and frog (18) variants: Bedrock's VARIANT (2).
+                        (20, Data::Id(v)) if kind == "minecraft:cat" => {
+                            e.meta(2, 2).varint(self.variant("minecraft:cat_variant", v));
+                            entries.insert(2, e.0);
+                        }
+                        (23, Data::Id(v)) if kind == "minecraft:wolf" => {
+                            e.meta(2, 2).varint(self.variant("minecraft:wolf_variant", v));
+                            entries.insert(2, e.0);
+                        }
+                        (18, Data::Id(v)) if kind == "minecraft:frog" => {
+                            e.meta(2, 2).varint(self.variant("minecraft:frog_variant", v));
+                            entries.insert(2, e.0);
+                        }
                         _ => {}
                     }
                 }
@@ -920,7 +936,11 @@ impl Session {
             crate::java::Event::BlockBroken { pos, state } if self.spawned => packets.push(destroyed(pos, state)),
             crate::java::Event::BlockBroken { .. } => {}
             crate::java::Event::Biomes(biomes) => self.biomes = biomes,
-            crate::java::Event::Enchantments(names) => self.enchants = names.iter().map(|n| bedrock_enchantment(n)).collect(),
+            crate::java::Event::Variants { registry, names } => {
+                let ids = names.iter().map(|n| bedrock_variant(&registry, n)).collect();
+                self.variants.insert(registry, ids);
+            }
+            crate::java::Event::Enchantments(names) =>self.enchants = names.iter().map(|n| bedrock_enchantment(n)).collect(),
             crate::java::Event::Sign(s) => {
                 let p = block_actor_data(s.pos, &crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -1096,6 +1116,11 @@ impl Session {
             cracks.push(crack(pos, Some(ticks)));
         }
         cracks
+    }
+
+    /// The Bedrock variant for a Java variant registry id (0 when unknown).
+    fn variant(&self, registry: &str, id: i32) -> i32 {
+        self.variants.get(registry).and_then(|v| v.get(id as usize)).copied().unwrap_or(0)
     }
 
     /// The Java block state at `pos`, as Horizon last sent it.
@@ -1309,9 +1334,14 @@ fn add_actor(rid: u64, identifier: &str, pos: [f64; 3], yaw: f32, pitch: f32, he
     w.f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32).f32(0.0).f32(0.0).f32(0.0); // position, velocity
     w.f32(pitch).f32(yaw).f32(head_yaw).f32(yaw); // pitch, yaw, head yaw, body yaw
     w.varuint(0); // no attributes
-    // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1
-    w.varuint(2);
+    // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1; a cat starts black,
+    // Java's default variant, which Horizon doesn't send (Bedrock's default is white).
+    let cat = identifier == "minecraft:cat";
+    w.varuint(2 + cat as u32);
     w.meta(0, 7).varint64(BASE_FLAGS);
+    if cat {
+        w.meta(2, 2).varint(1);
+    }
     w.meta(38, 3).f32(1.0);
     w.varuint(0).varuint(0).varuint(0).bool(false); // no synced properties, no links, not riding a block
     w.0
@@ -1688,6 +1718,20 @@ fn read_stack(r: &mut &[u8]) -> Result<(i16, u16), String> {
 /// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
 const SHIELD: i16 = 358;
 
+/// Bedrock's variant number for a Java cat, wolf or frog variant (orders as Geyser's), 0 when unknown.
+fn bedrock_variant(registry: &str, java: &str) -> i32 {
+    let order: &[&str] = match registry {
+        "minecraft:cat_variant" => &[
+            "white", "black", "red", "siamese", "british_shorthair", "calico", "persian", "ragdoll", "tabby", "all_black", "jellie",
+        ],
+        "minecraft:wolf_variant" => &["pale", "ashen", "black", "chestnut", "rusty", "snowy", "spotted", "striped", "woods"],
+        "minecraft:frog_variant" => &["temperate", "cold", "warm"],
+        _ => &[],
+    };
+    let name = java.strip_prefix("minecraft:").unwrap_or(java);
+    order.iter().position(|v| *v == name).map_or(0, |i| i as i32)
+}
+
 /// Bedrock's enchantment ids, in order (protection = 0 ... breach = 40), by Java name.
 const ENCHANTMENTS: [&str; 41] = [
     "protection", "fire_protection", "feather_falling", "blast_protection", "projectile_protection", "thorns",
@@ -1899,6 +1943,20 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mob_variants() {
+        use crate::java::{Data, Event};
+        let mut s = Session { spawned: true, ..Default::default() };
+        let names = ["all_black", "black", "british_shorthair", "calico"].map(|n| format!("minecraft:{n}")).to_vec();
+        s.on_java(Event::Variants { registry: "minecraft:cat_variant".into(), names });
+        s.shown.insert(4, Shown::Actor("minecraft:cat"));
+        let p = s.on_java(Event::EntityData { id: 4, values: vec![(20, Data::Id(3))] }); // calico
+        let mut want = W::default();
+        want.varuint64(6).varuint(2).meta(0, 7).varint64(BASE_FLAGS).meta(2, 2).varint(5);
+        assert_eq!(p[0][2..2 + want.0.len()], want.0[..]);
+        assert_eq!(bedrock_variant("minecraft:wolf_variant", "minecraft:woods"), 8);
+    }
 
     #[test]
     fn times_mining_like_java() {
