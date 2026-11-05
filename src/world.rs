@@ -139,33 +139,149 @@ fn chest(state: u32) -> Option<(i32, i32, bool)> {
 /// half leads), as Geyser does, so Bedrock pairs the two the way Java does and shows its 54 slots in order.
 pub fn chest_nbt(pos: [i32; 3], state: u32) -> Option<Vec<u8>> {
     let (dx, dz, lead) = chest(state)?;
-    let mut n = vec![10, 0]; // compound, empty name
-    let tag = |n: &mut Vec<u8>, kind: u8, name: &str| {
-        n.push(kind);
-        uvarint(n, name.len() as u32);
-        n.extend(name.as_bytes());
-    };
-    tag(&mut n, 8, "id");
-    uvarint(&mut n, 5);
-    n.extend(b"Chest");
-    for (name, v) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
-        tag(&mut n, 3, name);
-        varint(&mut n, v);
-    }
-    tag(&mut n, 1, "isMovable");
-    n.push(1);
+    let mut n = NbtOut::block_entity("Chest", pos);
+    n.byte("isMovable", 1);
     if (dx, dz) != (0, 0) {
-        tag(&mut n, 3, "pairx");
-        varint(&mut n, pos[0] + dx);
-        tag(&mut n, 3, "pairz");
-        varint(&mut n, pos[2] + dz);
+        n.int("pairx", pos[0] + dx).int("pairz", pos[2] + dz);
         if lead {
-            tag(&mut n, 3, "pairlead");
-            varint(&mut n, 1);
+            n.int("pairlead", 1);
         }
     }
-    n.push(0);
-    Some(n)
+    Some(n.end())
+}
+
+/// Bedrock sign data (as Geyser's SignBlockEntityTranslator): each side's lines joined by newlines.
+/// shortcut: text colour (always black) and glowing text aren't carried over; add them from the Java NBT.
+pub fn sign_nbt(pos: [i32; 3], hanging: bool, front: &str, back: &str) -> Vec<u8> {
+    let mut n = NbtOut::block_entity(if hanging { "HangingSign" } else { "Sign" }, pos);
+    for (side, text) in [("FrontText", front), ("BackText", back)] {
+        n.compound(side).string("Text", text).int("SignTextColor", 0xFF00_0000u32 as i32).byte("IgnoreLighting", 0);
+        n.0.push(0); // end of the side
+    }
+    n.byte("IsWaxed", 0).byte("isMovable", 1);
+    n.end()
+}
+
+/// Writer for a Bedrock network NBT compound (little-endian; varint lengths and ints).
+struct NbtOut(Vec<u8>);
+
+impl NbtOut {
+    /// A block entity: id and position.
+    fn block_entity(id: &str, pos: [i32; 3]) -> Self {
+        let mut n = NbtOut(vec![10, 0]); // root compound, empty name
+        n.string("id", id).int("x", pos[0]).int("y", pos[1]).int("z", pos[2]);
+        n
+    }
+    fn tag(&mut self, kind: u8, name: &str) -> &mut Self {
+        self.0.push(kind);
+        uvarint(&mut self.0, name.len() as u32);
+        self.0.extend(name.as_bytes());
+        self
+    }
+    fn string(&mut self, name: &str, v: &str) -> &mut Self {
+        self.tag(8, name);
+        uvarint(&mut self.0, v.len() as u32);
+        self.0.extend(v.as_bytes());
+        self
+    }
+    fn int(&mut self, name: &str, v: i32) -> &mut Self {
+        self.tag(3, name);
+        varint(&mut self.0, v);
+        self
+    }
+    fn byte(&mut self, name: &str, v: u8) -> &mut Self {
+        self.tag(1, name);
+        self.0.push(v);
+        self
+    }
+    fn compound(&mut self, name: &str) -> &mut Self {
+        self.tag(10, name)
+    }
+    fn end(mut self) -> Vec<u8> {
+        self.0.push(0);
+        self.0
+    }
+}
+
+/// The text of one side of a Bedrock sign, from the client's block entity data (network NBT): the `Text` of
+/// its `FrontText` or `BackText` compound.
+pub fn bedrock_sign_text(mut nbt: &[u8], front: bool) -> Option<String> {
+    let want = if front { "FrontText" } else { "BackText" };
+    let r = &mut nbt;
+    if take(r, 1).ok()?[0] != 10 {
+        return None;
+    }
+    skip_string(r)?; // root name
+    let mut found = None;
+    walk_compound(r, &mut |path: &str, name: &str, value: &str| {
+        if path == want && name == "Text" {
+            found = Some(value.to_string());
+        }
+    }, "")?;
+    found
+}
+
+fn skip_string(r: &mut &[u8]) -> Option<()> {
+    let n = read_uvarint(r).ok()? as usize;
+    take(r, n).ok().map(|_| ())
+}
+
+/// Reads a network NBT compound's entries, calling `seen(compound name, entry name, value)` for strings.
+fn walk_compound(r: &mut &[u8], seen: &mut dyn FnMut(&str, &str, &str), path: &str) -> Option<()> {
+    loop {
+        let kind = take(r, 1).ok()?[0];
+        if kind == 0 {
+            return Some(());
+        }
+        let n = read_uvarint(r).ok()? as usize;
+        let name = String::from_utf8_lossy(take(r, n).ok()?).into_owned();
+        walk_payload(r, kind, seen, &name, path)?;
+    }
+}
+
+fn walk_payload(r: &mut &[u8], kind: u8, seen: &mut dyn FnMut(&str, &str, &str), name: &str, path: &str) -> Option<()> {
+    match kind {
+        1 => drop(take(r, 1).ok()?),
+        2 => drop(take(r, 2).ok()?),
+        3 | 4 => drop(read_uvarint64(r)?),
+        5 => drop(take(r, 4).ok()?),
+        6 => drop(take(r, 8).ok()?),
+        7 => {
+            let n = read_uvarint(r).ok()? >> 1; // zigzag length
+            take(r, n as usize).ok()?;
+        }
+        8 => {
+            let n = read_uvarint(r).ok()? as usize;
+            let v = String::from_utf8_lossy(take(r, n).ok()?).into_owned();
+            seen(path, name, &v);
+        }
+        9 => {
+            let elem = take(r, 1).ok()?[0];
+            for _ in 0..read_uvarint(r).ok()? >> 1 {
+                walk_payload(r, elem, seen, name, path)?;
+            }
+        }
+        10 => walk_compound(r, seen, name)?,
+        11 | 12 => {
+            for _ in 0..read_uvarint(r).ok()? >> 1 {
+                read_uvarint64(r)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn read_uvarint64(r: &mut &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for i in 0..10 {
+        let b = take(r, 1).ok()?[0];
+        v |= ((b & 0x7F) as u64) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Converts the section data of a Java 26.3 chunk packet (24 overworld sections, y = -64..320) into a Bedrock
@@ -319,6 +435,15 @@ mod tests {
         assert_eq!(java_block(0), block_hash("minecraft:air"), "Java state 0 is air");
         assert_eq!(java_block(1), block_hash("minecraft:stone"), "Python generator and Rust hash agree");
         assert_eq!(java_block(u32::MAX), block_hash("minecraft:air"));
+    }
+
+    #[test]
+    fn sign_text_round_trip() {
+        let nbt = sign_nbt([1, 64, -2], false, "Hello\nBedrock", "back side");
+        assert_eq!(bedrock_sign_text(&nbt, true).as_deref(), Some("Hello\nBedrock"));
+        assert_eq!(bedrock_sign_text(&nbt, false).as_deref(), Some("back side"));
+        assert!(nbt.windows(4).any(|w| w == b"Sign") && !nbt.windows(11).any(|w| w == b"HangingSign"));
+        assert!(bedrock_sign_text(&[1, 2, 3], true).is_none(), "not a compound");
     }
 
     #[test]

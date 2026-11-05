@@ -218,6 +218,8 @@ pub enum Command {
     CloseInventory,
     /// The player closed an open container window.
     CloseContainer(i32),
+    /// The player wrote on a sign (sign_update): position, side, four lines.
+    SignUpdate { pos: [i32; 3], front: bool, lines: [String; 4] },
 }
 
 /// Container slots of the Java menus the bridge shows (menu registry ids, 26.3): chests and barrels (generic
@@ -277,8 +279,12 @@ fn write_item(out: &mut Vec<u8>, item: Option<Item>) {
 pub enum Event {
     /// Player feet position and rotation (absolute).
     Position { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
-    /// A chunk column: the section data of a level_chunk_with_light packet.
-    Chunk { x: i32, z: i32, data: Vec<u8> },
+    /// A chunk column: the section data of a level_chunk_with_light packet, and its signs.
+    Chunk { x: i32, z: i32, data: Vec<u8>, signs: Vec<Sign> },
+    /// A sign's text changed (block_entity_data).
+    Sign(Sign),
+    /// The server asks the player to write on the sign they placed (open_sign_editor).
+    OpenSign { pos: [i32; 3], front: bool },
     /// Java game mode: 0 survival, 1 creative, 2 adventure, 3 spectator.
     GameMode(u8),
     /// A chat line: `from` is the sender for player chat, `None` for system messages; overlay = action bar.
@@ -398,6 +404,42 @@ fn read_varint_sync(r: &mut &[u8]) -> io::Result<i32> {
         }
     }
     Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"))
+}
+
+/// sign_update (26.3): position, the four lines, then the side as a varint (1 = front). Older versions sent
+/// the side before the lines; Horizon drops a player whose packet has them the other way round.
+fn sign_update(pos: [i32; 3], front: bool, lines: &[String; 4]) -> Vec<u8> {
+    let mut m = block_pos(pos).to_vec();
+    for line in lines {
+        write_string(&mut m, line);
+    }
+    write_varint(&mut m, front as i32);
+    m
+}
+
+/// A sign's text, each side's lines joined with newlines.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sign {
+    pub pos: [i32; 3],
+    pub hanging: bool,
+    pub front: String,
+    pub back: String,
+}
+
+/// A sign block entity (types 7 sign, 8 hanging sign in 26.3): {front_text, back_text: {messages: [4 lines]}}.
+fn sign(pos: [i32; 3], kind: i32, nbt: &Nbt) -> Option<Sign> {
+    if !matches!(kind, 7 | 8) {
+        return None;
+    }
+    let field = |n: &'_ Nbt, k: &str| match n {
+        Nbt::Compound(f) => f.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone()),
+        _ => None,
+    };
+    let side = |k: &str| match field(nbt, k).and_then(|s| field(&s, "messages")) {
+        Some(Nbt::List(lines)) => lines.iter().map(component_text).collect::<Vec<_>>().join("\n").trim_end_matches('\n').to_string(),
+        _ => String::new(),
+    };
+    Some(Sign { pos, hanging: kind == 8, front: side("front_text"), back: side("back_text") })
 }
 
 /// An entity metadata value the bridge uses.
@@ -638,6 +680,7 @@ async fn read_delta(mut r: &[u8]) -> io::Result<([f64; 3], &[u8])> {
 }
 
 /// Just enough of an NBT tree to flatten text components.
+#[derive(Clone)]
 enum Nbt {
     Str(String),
     Compound(Vec<(String, Nbt)>),
@@ -948,6 +991,7 @@ pub async fn play(
                         c.send(0x1a, &m).await?; // interact
                     }
                     Command::CloseInventory => c.send(0x13, &[0]).await?, // container_close, window 0
+                    Command::SignUpdate { pos, front, lines } => c.send(0x3e, &sign_update(pos, front, &lines)).await?,
                     Command::CloseContainer(window) => {
                         if open.is_some_and(|(w, _)| w == window) {
                             open = None;
@@ -1368,6 +1412,24 @@ pub async fn play(
                     return Ok(());
                 }
             }
+            (State::Game, 0x06) => {
+                // block_entity_data: position, type, NBT.
+                let pos = read_block_pos(&mut r)?;
+                let kind = read_varint_sync(&mut r)?;
+                if let Some(s) = sign(pos, kind, &read_nbt(&mut r)?)
+                    && events.send(Event::Sign(s)).is_err()
+                {
+                    return Ok(());
+                }
+            }
+            (State::Game, 0x3d) => {
+                // open_sign_editor: position, front side.
+                let pos = read_block_pos(&mut r)?;
+                let front = take_bytes(&mut r, 1)?[0] != 0;
+                if events.send(Event::OpenSign { pos, front }).is_err() {
+                    return Ok(());
+                }
+            }
             (State::Game, 0x08 | 0x56) => {
                 let blocks = if id == 0x08 {
                     // block_update: position, block state
@@ -1421,7 +1483,21 @@ pub async fn play(
                 }
                 let len = read_varint(&mut r).await? as usize;
                 let data = r.get(..len).ok_or_else(bad)?.to_vec();
-                if events.send(Event::Chunk { x, z, data }).is_err() {
+                r = &r[len..];
+                // Block entities: packed x/z (u8), y (i16), type, NBT. Signs are shown on Bedrock.
+                let mut signs = Vec::new();
+                let _ = (|| -> io::Result<()> {
+                    for _ in 0..read_varint_sync(&mut r)? {
+                        let xz = take_bytes(&mut r, 1)?[0];
+                        let y = i16::from_be_bytes(take_bytes(&mut r, 2)?.try_into().unwrap()) as i32;
+                        let kind = read_varint_sync(&mut r)?;
+                        let nbt = read_nbt(&mut r)?;
+                        let pos = [x * 16 + (xz >> 4) as i32, y, z * 16 + (xz & 15) as i32];
+                        signs.extend(sign(pos, kind, &nbt));
+                    }
+                    Ok(())
+                })();
+                if events.send(Event::Chunk { x, z, data, signs }).is_err() {
                     return Ok(());
                 }
                 chunks += 1;
@@ -1535,6 +1611,61 @@ mod tests {
             }
         }
         session.abort();
+    }
+
+    /// Live check: place a sign (the console gives the test player signs first) two blocks east of the feet,
+    /// then right-click it, and print the sign editors Horizon opens.
+    #[tokio::test]
+    #[ignore]
+    async fn places_signs() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let mut at = None;
+        while at.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            at = rx.try_iter().find_map(|e| if let Event::Position { x, y, z, .. } = e { Some([x, y, z]) } else { None });
+        }
+        let [x, y, z] = at.unwrap();
+        let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+        for tick in 0..160 {
+            let _ = cmd_tx.send(Command::Move { x, y, z, yaw: 0.0, pitch: 60.0, on_ground: true });
+            match tick {
+                80 if std::env::var_os("HANGING").is_some() => {
+                    // Under the block the console put two above the feet: a hanging sign.
+                    drop(cmd_tx.send(Command::UseOn { pos: [fx + 2, fy + 2, fz], face: 0, cursor: [0.5, 0.0, 0.5] }))
+                }
+                80 => drop(cmd_tx.send(Command::UseOn { pos: [fx + 2, fy - 1, fz], face: 1, cursor: [0.5, 1.0, 0.5] })),
+                // Write on the hanging sign Horizon opened the editor for.
+                100 if std::env::var_os("HANGING").is_some() => {
+                    let lines = ["hello".to_string(), "from the test".to_string(), String::new(), String::new()];
+                    drop(cmd_tx.send(Command::SignUpdate { pos: [fx + 2, fy + 1, fz], front: true, lines }))
+                }
+                // Right-click the placed sign itself.
+                110 if std::env::var_os("HANGING").is_none() => {
+                    drop(cmd_tx.send(Command::UseOn { pos: [fx + 2, fy, fz], face: 4, cursor: [0.0, 0.5, 0.5] }))
+                }
+                _ => {}
+            }
+            let _ = cmd_tx.send(Command::TickEnd);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for e in rx.try_iter() {
+                match e {
+                    Event::OpenSign { pos, front } => println!("open sign {pos:?} front {front}"),
+                    Event::Block { pos, state } => println!("block {pos:?} = {state}"),
+                    _ => {}
+                }
+            }
+        }
+        session.abort();
+    }
+
+    #[test]
+    fn sign_update_layout() {
+        // Horizon's own test vector: BlockPos, four strings with no count, then the side (back = 0).
+        let lines = ["Hi".to_string(), String::new(), "x".to_string(), String::new()];
+        let body = sign_update([-4, 70, 9], false, &lines);
+        assert_eq!(body[8..], [2, b'H', b'i', 0, 1, b'x', 0, 0]);
     }
 
     #[test]
@@ -1655,7 +1786,12 @@ mod tests {
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
                 Event::EntityData { id, values } => println!("entity data {id}: {values:?}"),
                 Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } | Event::Animate { .. } => {}
-                Event::Chunk { data, .. } => {
+                Event::Sign(s) => println!("sign {s:?}"),
+                Event::OpenSign { pos, front } => println!("open sign {pos:?} front {front}"),
+                Event::Chunk { data, signs, .. } => {
+                    for s in signs {
+                        println!("sign {s:?}");
+                    }
                     crate::world::java_chunk_to_bedrock(&data, 0, 0, &[]).expect("translates");
                     chunks += 1;
                 }

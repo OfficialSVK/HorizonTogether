@@ -65,6 +65,7 @@ const CONTAINER_OPEN: u32 = 46;
 const CONTAINER_CLOSE: u32 = 47;
 const CONTAINER_SET_DATA: u32 = 51;
 const BLOCK_ACTOR_DATA: u32 = 56;
+const OPEN_SIGN: u32 = 303;
 const ITEM_STACK_REQUEST: u32 = 147;
 const ITEM_STACK_RESPONSE: u32 = 148;
 const SET_TIME: u32 = 10;
@@ -149,6 +150,8 @@ pub struct Session {
     craft: [Option<crate::java::Item>; 4],
     /// Bedrock biome id per Java biome id (Horizon's biome registry).
     biomes: Vec<u32>,
+    /// The sign the player is writing on (Horizon opened its editor): position, front side.
+    editing: Option<([i32; 3], bool)>,
 }
 
 impl Default for Session {
@@ -185,6 +188,7 @@ impl Default for Session {
             recipe: 0,
             craft: [None; 4],
             biomes: Vec::new(),
+            editing: None,
         }
     }
 }
@@ -452,6 +456,20 @@ impl Session {
                     } else if let Some(open) = self.open.take_if(|o| o.window == window) {
                         self.to_java.push(crate::java::Command::CloseContainer(open.java_window));
                     }
+                }
+                // BlockActorData from the client: the text written on the sign Horizon opened the editor for.
+                BLOCK_ACTOR_DATA if self.linked => {
+                    let pos = read_block_pos(&mut packet)?;
+                    println!("Bedrock: sign text from the client at {pos:?} (editing {:?})", self.editing);
+                    let Some((at, front)) = self.editing.filter(|(at, _)| *at == pos) else { continue };
+                    self.editing = None;
+                    let text = crate::world::bedrock_sign_text(packet, front).unwrap_or_default();
+                    let mut lines: [String; 4] = Default::default();
+                    for (line, part) in lines.iter_mut().zip(text.split('\n')) {
+                        *line = part.chars().take(384).collect();
+                    }
+                    println!("Bedrock: sign at {at:?} -> Horizon: {lines:?}");
+                    self.to_java.push(crate::java::Command::SignUpdate { pos: at, front, lines });
                 }
                 ITEM_STACK_REQUEST if self.linked && self.spawn_status_sent => {
                     let raw = packet;
@@ -855,15 +873,30 @@ impl Session {
                 let mut p = vec![packet_bytes(UPDATE_BLOCK, &w.0)];
                 // A chest's pairing (a second chest placed beside it changes both): its block entity data.
                 if let Some(nbt) = crate::world::chest_nbt(pos, state) {
-                    let mut e = W::default();
-                    e.varint(pos[0]).varint(pos[1]).varint(pos[2]).bytes(&nbt);
-                    p.push(packet_bytes(BLOCK_ACTOR_DATA, &e.0));
+                    p.push(block_actor_data(pos, &nbt));
                 }
                 if self.spawned { packets.extend(p) } else { self.pending.extend(p) }
             }
             crate::java::Event::Biomes(biomes) => self.biomes = biomes,
-            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data, x, z, &self.biomes) {
-                Ok((count, payload)) => {
+            crate::java::Event::Sign(s) => {
+                let p = block_actor_data(s.pos, &crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
+            }
+            // The player placed a sign: Bedrock's own editor opens on OpenSign (position, front side).
+            crate::java::Event::OpenSign { pos, front } if self.spawned => {
+                println!("Bedrock: Horizon opened the sign editor at {pos:?} (front {front})");
+                self.editing = Some((pos, front));
+                let mut w = W::default();
+                w.varint(pos[0]).varint(pos[1]).varint(pos[2]).bool(front);
+                packets.push(packet_bytes(OPEN_SIGN, &w.0));
+            }
+            crate::java::Event::OpenSign { .. } => {}
+            crate::java::Event::Chunk { x, z, data, signs } => match crate::world::java_chunk_to_bedrock(&data, x, z, &self.biomes) {
+                Ok((count, mut payload)) => {
+                    // Block entities end the payload, so the signs' data goes after the chests'.
+                    for s in signs {
+                        payload.extend(crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
+                    }
                     let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
                     if self.spawned { packets.push(p) } else { self.pending.push(p) }
                 }
@@ -927,6 +960,12 @@ impl Session {
             println!("Bedrock: click on block {:?} face {} via {from} -> Horizon", u.pos, u.face);
             self.last_click = Some((u.pos, u.face, std::time::Instant::now()));
             let face = u.face.min(5) as u8;
+            // The click names the hotbar slot it was made with: Horizon is told it first, so both use the
+            // same item even if a slot change was missed.
+            if let Ok(slot @ 0..=8) = u8::try_from(u.slot) {
+                self.held = slot;
+                self.to_java.push(crate::java::Command::HeldSlot(slot));
+            }
             self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
         }
     }
@@ -1133,6 +1172,13 @@ fn player_metadata() -> Vec<u8> {
     w.meta(54, FLOAT).f32(1.8); // bounding box height
     w.varuint(0).varuint(0).varuint64(0); // no synced int/float properties, input tick
     w.0
+}
+
+/// BlockActorData: a block entity's data (network NBT) at a position.
+fn block_actor_data(pos: [i32; 3], nbt: &[u8]) -> Vec<u8> {
+    let mut w = W::default();
+    w.varint(pos[0]).varint(pos[1]).varint(pos[2]).bytes(nbt);
+    packet_bytes(BLOCK_ACTOR_DATA, &w.0)
 }
 
 /// How a Java entity is shown on Bedrock: a player, or an actor with its Bedrock identifier.
@@ -1542,6 +1588,8 @@ fn write_stack(w: &mut W, item: Option<crate::java::Item>, net_id: Option<i32>) 
 struct ItemUse {
     /// ItemUseActionType: 0 place (click a block), 1 use, 2 destroy.
     action: i32,
+    /// The hotbar slot the click was made with.
+    slot: i32,
     /// 1 = player input; 2 = repeated by the simulation while the button is held.
     trigger: u32,
     pos: [i32; 3],
@@ -1610,7 +1658,7 @@ fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
     let trigger = take(r, 1)?[0] as u32;
     let pos = read_block_pos(r)?;
     let face = take(r, 1)?[0] as u32;
-    read_uvarint(r)?; // hotbar slot
+    let slot = zigzag(read_uvarint(r)?); // hotbar slot
     take(r, 1)?; // hand
     skip_item(r)?;
     take(r, 12)?; // player position
@@ -1620,7 +1668,7 @@ fn read_item_use(r: &mut &[u8]) -> Result<ItemUse, String> {
     }
     read_uvarint(r)?; // target block runtime id
     take(r, 2)?; // client prediction, cooldown state
-    Ok(ItemUse { action, trigger, pos, face, click })
+    Ok(ItemUse { action, slot, trigger, pos, face, click })
 }
 
 fn take<'a>(r: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
@@ -1719,6 +1767,7 @@ mod tests {
         p.extend([0, 0, 0]); // block runtime id, prediction, cooldown
         let Ok(Transaction::Use(u)) = read_transaction(&mut &p[..]) else { panic!("item use") };
         assert_eq!((u.action, u.trigger, u.pos, u.face, u.click), (0, 1, [192, 66, 60], 1, [0.5, 1.0, 0.25]));
+        assert_eq!(u.slot, 2, "the hotbar slot the stone was placed from");
         assert_eq!(read_input_flags(&mut &[2, 100, 70][..]).unwrap(), 1 << 50 | 1 << 35, "VerticalCollision, PerformBlockActions");
     }
 
