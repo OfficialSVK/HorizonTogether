@@ -514,6 +514,9 @@ impl Session {
                 BLOCK_PICK_REQUEST if self.linked && self.spawn_status_sent => {
                     let pos = read_block_pos(&mut packet)?;
                     let data = packet.first() == Some(&1);
+                    let eye = self.eye();
+                    let far = (0..3).map(|i| (pos[i] as f32 + 0.5 - eye[i]).powi(2)).sum::<f32>().sqrt();
+                    println!("Bedrock: pick block {pos:?}, {far:.1} blocks from the eyes -> Horizon");
                     self.to_java.push(crate::java::Command::PickBlock { pos, data });
                 }
                 // PlayerAction: runtime id, action, block position, result position, face.
@@ -532,8 +535,15 @@ impl Session {
                     let raw = packet;
                     match read_transaction(&mut packet) {
                         Ok(Transaction::Use(u)) => self.item_use(u, "InventoryTransaction"),
-                        Ok(Transaction::OnEntity { target, attack }) if target >= 2 => {
+                        Ok(Transaction::OnEntity { target, attack, slot }) if target >= 2 => {
                             let id = (target - 2) as i32; // entity_id(): Java id + 2
+                            // As for block clicks: Horizon uses the item of the slot the click was made with.
+                            if let Ok(slot @ 0..=8) = u8::try_from(slot) {
+                                self.held = slot;
+                                self.to_java.push(crate::java::Command::HeldSlot(slot));
+                            }
+                            let item = self.inventory[self.held as usize].map(|i| (i.id, i.count));
+                            println!("Bedrock: {} entity {id} with slot {} ({item:?})", if attack { "attack" } else { "interact with" }, self.held);
                             self.to_java.push(if attack { crate::java::Command::Attack(id) } else { crate::java::Command::Interact(id) });
                         }
                         Ok(Transaction::Drop(n)) => self.drop_held(n),
@@ -692,6 +702,20 @@ impl Session {
                 };
                 packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(rid).u8(2).varint(0).bool(false).0));
             }
+            // Java entity events with a Bedrock ActorEvent: taming failed (smoke) and succeeded (hearts), shaking
+            // off water and eating grass keep their numbers; love hearts (villagers 12, animals 18) are 21, an
+            // angry or happy villager 22 and 23.
+            crate::java::Event::EntityEvent { id, event } if self.spawned && self.shown.contains_key(&id) => {
+                let bedrock = match event {
+                    6 | 7 | 8 | 10 => event,
+                    12 | 18 => 21,
+                    13 => 22,
+                    14 => 23,
+                    _ => return Vec::new(),
+                };
+                packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(entity_id(id)).u8(bedrock).varint(0).bool(false).0));
+            }
+            crate::java::Event::EntityEvent { .. } => {}
             crate::java::Event::Death(id) if self.spawned && self.shown.contains_key(&id) => {
                 packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(entity_id(id)).u8(3).varint(0).bool(false).0));
             }
@@ -730,6 +754,21 @@ impl Session {
                             e.meta(3, 0).u8(w & 15);
                             entries.insert(3, e.0);
                         }
+                        // Pets: sitting (1) and tamed (4) flags; the collar's dye colour (wolf 21, cat 23, Bedrock's
+                        // colour 3); a cat lying down (21) rests.
+                        (18, Data::Byte(f)) if matches!(kind, "minecraft:wolf" | "minecraft:cat" | "minecraft:parrot") => {
+                            set(&mut flags, FLAG_SITTING, f & 1 != 0);
+                            set(&mut flags, FLAG_TAMED, f & 4 != 0);
+                        }
+                        (21, Data::Int(c)) if kind == "minecraft:wolf" => {
+                            e.meta(3, 0).u8(c as u8 & 15);
+                            entries.insert(3, e.0);
+                        }
+                        (23, Data::Int(c)) if kind == "minecraft:cat" => {
+                            e.meta(3, 0).u8(c as u8 & 15);
+                            entries.insert(3, e.0);
+                        }
+                        (21, Data::Bool(lying)) if kind == "minecraft:cat" => set(&mut flags, FLAG_RESTING, lying),
                         // Cat (20), wolf (23) and frog (18) variants: Bedrock's VARIANT (2).
                         (20, Data::Id(v)) if kind == "minecraft:cat" => {
                             e.meta(2, 2).varint(self.variant("minecraft:cat_variant", v));
@@ -787,6 +826,9 @@ impl Session {
             }
             // Only what differs from Bedrock's view is sent: Horizon echoes the slots Bedrock itself just changed.
             crate::java::Event::Inventory { slots } => {
+                if slots.len() < 5 {
+                    println!("Bedrock: Horizon sets slots {:?}", slots.iter().map(|(i, s)| (i, s.map(|s| (s.id, s.count)))).collect::<Vec<_>>());
+                }
                 for (i, item) in slots {
                     if self.inventory[i as usize] != item {
                         self.inventory[i as usize] = item;
@@ -912,6 +954,7 @@ impl Session {
                 if self.spawned { packets.extend(out) } else { self.pending.extend(out) }
             }
             crate::java::Event::HeldSlot(slot) => {
+                println!("Bedrock: Horizon selects hotbar slot {slot} ({:?})", self.inventory[slot as usize].map(|i| (i.id, i.count)));
                 self.held = slot;
                 if self.spawned {
                     packets.push(hotbar(slot));
@@ -925,11 +968,16 @@ impl Session {
                 // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
                 let mut w = W::default();
                 w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
-                w.varuint(3).varuint(0); // flags: neighbours + network; layer 0
+                // Flags: neighbours, network and priority (as Geyser), which also overrides the client's own guess, such
+                // as a block it placed that Horizon refused (out of Java's reach); layer 0.
+                w.varuint(11).varuint(0);
                 let mut p = vec![packet_bytes(UPDATE_BLOCK, &w.0)];
                 // The block the player just placed: Bedrock waits for the server's place sound.
                 if state != 0 && self.placing.take_if(|(at, t)| *at == pos && t.elapsed().as_secs() < 2).is_some() {
+                    println!("Bedrock: place sound at {pos:?} (state {state})");
                     p.push(place_sound(pos, state));
+                } else if let Some((at, _)) = self.placing.filter(|(at, _)| (0..3).all(|i| (at[i] - pos[i]).abs() <= 1)) {
+                    println!("Bedrock: block {pos:?} = {state} next to the placing target {at:?}");
                 }
                 // A chest's pairing (a second chest placed beside it changes both): its block entity data.
                 if let Some(nbt) = crate::world::chest_nbt(pos, state) {
@@ -1047,6 +1095,9 @@ impl Session {
                 self.held = slot;
                 self.to_java.push(crate::java::Command::HeldSlot(slot));
             }
+            let eye = self.eye();
+            let far = (0..3).map(|i| (u.pos[i] as f32 + 0.5 - eye[i]).powi(2)).sum::<f32>().sqrt();
+            println!("Bedrock: holding slot {} ({:?}), {far:.1} blocks from the eyes", self.held, self.inventory[self.held as usize].map(|i| (i.id, i.count)));
             self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
             // Where a placed block would go (faces: down, up, north, south, west, east), for its place sound.
             let [dx, dy, dz] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face as usize];
@@ -1325,6 +1376,9 @@ const FLAG_BABY: i64 = 1 << 11;
 const FLAG_SHOW_NAME: i64 = 1 << 14;
 const FLAG_ALWAYS_SHOW_NAME: i64 = 1 << 15;
 const FLAG_SHEARED: i64 = 1 << 31;
+const FLAG_RESTING: i64 = 1 << 23;
+const FLAG_SITTING: i64 = 1 << 24;
+const FLAG_TAMED: i64 = 1 << 28;
 
 /// Mobs whose Java metadata index 16 is "baby" (AgeableMob and Zombie subclasses). shortcut: piglins (17)
 /// and the few others with their baby flag elsewhere stay grown; add them by their index when needed.
@@ -1345,13 +1399,17 @@ fn add_actor(rid: u64, identifier: &str, pos: [f64; 3], yaw: f32, pitch: f32, he
     w.f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32).f32(0.0).f32(0.0).f32(0.0); // position, velocity
     w.f32(pitch).f32(yaw).f32(head_yaw).f32(yaw); // pitch, yaw, head yaw, body yaw
     w.varuint(0); // no attributes
-    // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1; a cat starts black,
-    // Java's default variant, which Horizon doesn't send (Bedrock's default is white).
+    // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1. Java's defaults that
+    // Horizon doesn't send, where Bedrock's differ: a cat is black, a wolf's and a cat's collar red (14), not white.
     let cat = identifier == "minecraft:cat";
-    w.varuint(2 + cat as u32);
+    let collar = cat || identifier == "minecraft:wolf";
+    w.varuint(2 + cat as u32 + collar as u32);
     w.meta(0, 7).varint64(BASE_FLAGS);
     if cat {
         w.meta(2, 2).varint(1);
+    }
+    if collar {
+        w.meta(3, 0).u8(14);
     }
     w.meta(38, 3).f32(1.0);
     w.varuint(0).varuint(0).varuint(0).bool(false); // no synced properties, no links, not riding a block
@@ -1871,7 +1929,8 @@ enum Transaction {
     /// A click on a block (type 2).
     Use(ItemUse),
     /// Attack (or use, `attack` false) another entity: its runtime id (type 3).
-    OnEntity { target: u64, attack: bool },
+    /// A click on an entity, with the hotbar slot it was made with.
+    OnEntity { target: u64, attack: bool, slot: i32 },
     /// Items dropped from the hotbar (Q) (type 0, normal).
     Drop(u32),
     Other,
@@ -1891,7 +1950,8 @@ fn read_transaction(r: &mut &[u8]) -> Result<Transaction, String> {
             read_inventory_actions(r)?;
             let target = read_uvarint128(r)? as u64;
             let action = zigzag(read_uvarint(r)?);
-            Transaction::OnEntity { target, attack: action == 1 }
+            let slot = zigzag(read_uvarint(r)?);
+            Transaction::OnEntity { target, attack: action == 1, slot }
         }
         _ => Transaction::Other,
     })

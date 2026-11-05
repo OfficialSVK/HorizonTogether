@@ -7,6 +7,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+mod components;
+
 /// Java Edition 26.3 (from MCProtocolLib's MinecraftCodec, which Geyser uses).
 pub const PROTOCOL: i32 = 777;
 
@@ -319,6 +321,8 @@ pub enum Event {
     AddEntity { id: i32, kind: i32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
     /// A dropped item stack appeared.
     AddItem { id: i32, item: Item, pos: [f64; 3] },
+    /// Another entity event (Java's EntityEvent ids: 6 taming failed, 7 tamed, 18 in love...).
+    EntityEvent { id: i32, event: u8 },
     /// Someone else broke a block (its particles and sound): position and the state it was.
     BlockBroken { pos: [i32; 3], state: u32 },
     /// An entity was hurt (its red flash); `None` is our own player.
@@ -424,7 +428,7 @@ fn read_component(r: &mut &[u8], item: &mut Item) -> io::Result<()> {
             }
         }
         1 | 2 | 12 | 19 | 48 => drop(read_varint_sync(r)?), // max stack size, max damage, rarity, repair cost, map id
-        4 | 20 | 22 | 120 => {}                                    // unbreakable, creative slot lock, intangible projectile, waxed
+        4 | 20 | 120 => {}                                         // unbreakable, creative slot lock, waxed
         0 | 6 | 9 => drop(read_nbt(r)?),                           // custom data, custom name, item name
         10 => {
             let n = read_varint_sync(r)? as usize;
@@ -437,7 +441,7 @@ fn read_component(r: &mut &[u8], item: &mut Item) -> io::Result<()> {
         }
         21 => drop(take_bytes(r, 1)?), // enchantment glint override
         47 => drop(take_bytes(r, 4)?), // dyed colour
-        t => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("item data component {t} not decoded yet"))),
+        t => components::skip(t, r)?, // everything else: read past (shulker and chest contents, books, potions...)
     }
     Ok(())
 }
@@ -499,6 +503,8 @@ pub enum Data {
     Text(Option<String>),
     /// A registry id: the cat, cow, wolf, frog, pig and chicken variants (and their sound variants).
     Id(i32),
+    /// An int or a dye colour (a collar).
+    Int(i32),
     /// A value of another type, read past.
     Other,
 }
@@ -518,9 +524,10 @@ fn read_entity_data(mut r: &[u8]) -> Vec<(u8, Data)> {
             5 => Data::Text(Some(component_text(&read_nbt(&mut r)?))),
             6 => Data::Text(if take_bytes(&mut r, 1)?[0] != 0 { Some(component_text(&read_nbt(&mut r)?)) } else { None }),
             21..=32 => Data::Id(read_varint_sync(&mut r)?),
-            // Read past: int, direction, block states, optional int, pose, painting variant to weathering state,
-            // arm and dye; long, float, string, item stack.
-            1 | 12 | 14 | 15 | 19 | 20 | 34..=38 | 42 | 43 => read_varint_sync(&mut r).map(|_| Data::Other)?,
+            1 | 43 => Data::Int(read_varint_sync(&mut r)?),
+            // Read past: direction, block states, optional int, pose, painting variant to weathering state, arm;
+            // long, float, string, item stack.
+            12 | 14 | 15 | 19 | 20 | 34..=38 | 42 => read_varint_sync(&mut r).map(|_| Data::Other)?,
             2 => read_varlong(&mut r).map(|_| Data::Other)?,
             3 => take_bytes(&mut r, 4).map(|_| Data::Other)?,
             4 => {
@@ -1526,10 +1533,14 @@ pub async fn play(
                         let action = take_bytes(&mut r, 1)?[0];
                         tracked.contains_key(&target).then_some(Event::Animate { id: target, action })
                     }
-                    // entity_event: id (i32), event (3 = death animation).
+                    // entity_event: id (i32), event (3 = death animation; others such as taming hearts or smoke).
                     0x22 => {
                         let target = i32::from_be_bytes(take_bytes(&mut r, 4)?.try_into().unwrap());
-                        (take_bytes(&mut r, 1)?[0] == 3 && tracked.contains_key(&target)).then_some(Event::Death(target))
+                        match take_bytes(&mut r, 1)?[0] {
+                            _ if !tracked.contains_key(&target) => None,
+                            3 => Some(Event::Death(target)),
+                            event => Some(Event::EntityEvent { id: target, event }),
+                        }
                     }
                     // hurt_animation (id, yaw) and damage_event (id, then the damage source): vanilla clients flash
                     // an entity red on damage_event; hurt_animation is the player's own.
@@ -1841,6 +1852,39 @@ mod tests {
         session.abort();
     }
 
+    /// Middle-clicks the block under the test player at tick 80 and prints the inventory updates; for a creative
+    /// pick of an item not in the hotbar, run `clear .BridgeTest` and `gamemode creative .BridgeTest` first.
+    #[tokio::test]
+    #[ignore]
+    async fn picks_blocks() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let mut at = None;
+        while at.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            at = rx.try_iter().find_map(|e| if let Event::Position { x, y, z, .. } = e { Some([x, y, z]) } else { None });
+        }
+        let [x, y, z] = at.unwrap();
+        for tick in 0..120 {
+            let _ = cmd_tx.send(Command::Move { x, y, z, yaw: 0.0, pitch: 90.0, on_ground: true });
+            if tick == 80 {
+                let _ = cmd_tx.send(Command::PickBlock { pos: [x.floor() as i32, y.floor() as i32 - 1, z.floor() as i32], data: false });
+            }
+            let _ = cmd_tx.send(Command::TickEnd);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for e in rx.try_iter() {
+                match e {
+                    Event::Inventory { slots } if slots.len() < 10 => println!("tick {tick}: inventory {slots:?}"),
+                    Event::Inventory { slots } => println!("tick {tick}: whole inventory ({} slots)", slots.len()),
+                    Event::HeldSlot(s) => println!("tick {tick}: held slot {s}"),
+                    _ => {}
+                }
+            }
+        }
+        session.abort();
+    }
+
     #[test]
     fn sign_update_layout() {
         // Horizon's own test vector: BlockPos, four strings with no count, then the side (back = 0).
@@ -1853,7 +1897,7 @@ mod tests {
     fn reads_entity_data() {
         // Air supply (index 1, int 300), baby (16, bool), wool (17, byte 0x1e), then the end marker.
         let body = [1, 1, 0xac, 0x02, 16, 8, 1, 17, 0, 0x1e, 0xff];
-        assert_eq!(read_entity_data(&body), [(1, Data::Other), (16, Data::Bool(true)), (17, Data::Byte(0x1e))]);
+        assert_eq!(read_entity_data(&body), [(1, Data::Int(300)), (16, Data::Bool(true)), (17, Data::Byte(0x1e))]);
         // An undecoded type (9, rotations) ends the read with what came before it.
         assert_eq!(read_entity_data(&[16, 8, 0, 5, 9, 0, 0, 0]), [(16, Data::Bool(false))]);
     }
@@ -1881,7 +1925,12 @@ mod tests {
         let mut out = Vec::new();
         write_item(&mut out, Some(sword));
         assert_eq!(out, [1, 1, 1, 0, 13, 3, 1, 13, 3]);
-        assert!(read_item(&mut &[1, 1, 1, 0, 99, 0][..]).is_err(), "unknown component");
+        assert!(read_item(&mut &[1, 1, 1, 0, 200, 1, 0][..]).is_err(), "unknown component");
+        // A chest holding two cobblestone (container, 77: one present template: item 35, count 2, empty patch),
+        // then a custom name (6, an NBT string): read past to the next slot's byte.
+        let mut r = &[1, 0xa3, 0x02, 2, 0, 77, 1, 1, 35, 2, 0, 0, 6, 8, 0, 2, b'h', b'i', 9][..];
+        assert_eq!(read_item(&mut r).unwrap(), Some(Item::new(291, 1)));
+        assert_eq!(r, [9]);
         assert_eq!((menu_to_inventory(36), menu_to_inventory(5), menu_to_inventory(45), menu_to_inventory(0)), (Some(0), Some(39), Some(40), None));
     }
 
@@ -1967,6 +2016,7 @@ mod tests {
                 Event::Chat { from, text, .. } => println!("chat from {from:?}: {text}"),
                 Event::AddPlayer { name, pos, .. } => println!("player {name} at {pos:?}"),
                 Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } | Event::BlockBroken { .. } => {}
+                Event::EntityEvent { id, event } => println!("entity {id} event {event}"),
                 Event::Rain(v) => println!("rain {v}"),
                 Event::Thunder(v) => println!("thunder {v}"),
                 Event::Time(t) => println!("time {t}"),
