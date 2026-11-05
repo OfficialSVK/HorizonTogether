@@ -293,6 +293,8 @@ pub enum Event {
     Hurt(Option<i32>),
     /// An entity died (its death animation).
     Death(i32),
+    /// An entity's animation (Java animate actions: 0 swing main hand, 3 swing offhand, 4 crit, 5 magic crit).
+    Animate { id: i32, action: u8 },
     /// A dropped item was picked up by an entity; `None` is our own player.
     TakeItem { item: i32, collector: Option<i32> },
     /// A tracked entity's new absolute position and rotation.
@@ -322,6 +324,8 @@ pub enum Event {
     ContainerData { window: i32, key: i16, value: i16 },
     /// The server closed the container window.
     CloseContainer(i32),
+    /// The Bedrock biome id of each Java biome id (from the biome registry), for chunk translation.
+    Biomes(Vec<u32>),
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
     Equipment { id: i32, slots: Vec<(u8, Option<Item>)> },
@@ -935,6 +939,25 @@ pub async fn play(
                 c.send(0x00, &info).await?;
             }
             (State::Config, 0x0f) => c.send(0x07, &body).await?, // we "know" every pack offered, so registries come by reference
+            (State::Config, 0x07) => {
+                // registry_data: registry name, then entries (name, optional NBT). The biome registry's order
+                // gives the biome ids chunks use.
+                let n = read_varint_sync(&mut r)? as usize;
+                if take_bytes(&mut r, n)? == b"minecraft:worldgen/biome" {
+                    let mut biomes = Vec::new();
+                    for _ in 0..read_varint_sync(&mut r)? {
+                        let n = read_varint_sync(&mut r)? as usize;
+                        let name = String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned();
+                        if take_bytes(&mut r, 1)?[0] != 0 {
+                            read_nbt(&mut r)?;
+                        }
+                        biomes.push(crate::world::bedrock_biome(&name));
+                    }
+                    if events.send(Event::Biomes(biomes)).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             (State::Config, 0x04) => c.send(0x04, &body).await?, // keep alive
             (State::Config, 0x05) => c.send(0x05, &body).await?, // ping -> pong
             (State::Config, 0x14) => c.send(0x09, &[]).await?,   // accept the code of conduct
@@ -1245,8 +1268,14 @@ pub async fn play(
                     Err(e) => eprintln!("Java: data of item entity {id} not read: {e}"),
                 }
             }
-            (State::Game, 0x22 | 0x2b | 0x19 | 0x7f) => {
+            (State::Game, 0x22 | 0x2b | 0x19 | 0x7f | 0x02) => {
                 let event = match id {
+                    // animate: id, action.
+                    0x02 => {
+                        let target = read_varint_sync(&mut r)?;
+                        let action = take_bytes(&mut r, 1)?[0];
+                        tracked.contains_key(&target).then_some(Event::Animate { id: target, action })
+                    }
                     // entity_event: id (i32), event (3 = death animation).
                     0x22 => {
                         let target = i32::from_be_bytes(take_bytes(&mut r, 4)?.try_into().unwrap());
@@ -1555,12 +1584,13 @@ mod tests {
                 Event::Health { health, food, saturation } => println!("health {health} food {food} saturation {saturation}"),
                 Event::Equipment { id, slots } => println!("equipment of {id}: {slots:?}"),
                 Event::OpenContainer { window, menu, size } => println!("container {window}: menu {menu}, {size} slots"),
+                Event::Biomes(b) => println!("{} biomes: {b:?}", b.len()),
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
-                Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } => {}
+                Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } | Event::Animate { .. } => {}
                 Event::Chunk { data, .. } => {
-                    crate::world::java_chunk_to_bedrock(&data, 0, 0).expect("translates");
+                    crate::world::java_chunk_to_bedrock(&data, 0, 0, &[]).expect("translates");
                     chunks += 1;
                 }
                 Event::Position { x, y, z, .. } => pos = Some((x, y, z)),

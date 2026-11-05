@@ -37,7 +37,7 @@ These are shortcuts that are deliberate for now. The ones inside the code are ma
 - **Login identity is not verified.** Anyone who can reach the bridge can join under any name. Keep it on a LAN or VPN until [ROADMAP](ROADMAP.md) item 1 is done.
 - **Mobs show their type only**: no variants (sheep colours, baby mobs), names or held items yet, and their hitbox size is the client's default. Other players' real skins and animations (swing, sneak) aren't shown. No crack animation while breaking a block.
 - **Crafting recipes are Bedrock 1.26.30's** (pmmp/BedrockData): results for items added since then don't show, and results with item data (fireworks, banners) are plain. Stonecutters, smithing tables and anvils don't open yet. Anvils, enchanting tables, brewing stands, looms and other workstations are closed again at once. Items show no damage, names or enchantment glint, and potions or enchanted books from the creative menu lose their effect on Horizon.
-- **Every biome is plains** (grass and leaf colours are off), and block entities (chests, signs) have no data. No biome definitions are sent (the client uses its built-in ones).
+- **Signs and other block entities** (apart from chests) have no data yet. No biome definitions are sent (the client uses its built-in ones, which Horizon's biomes map onto).
 - Relative teleports from Horizon are treated as absolute.
 - **One ephemeral UDP port per player.** This works on a LAN. Hosting behind port forwarding needs a fixed port range.
 - **Plain HTTP signaling**, so the client shows a "trust and join" prompt the first time. TLS would remove it.

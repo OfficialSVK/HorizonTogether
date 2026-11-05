@@ -107,6 +107,16 @@ pub fn recipe_output(net_id: u32) -> Option<(i32, u8)> {
     (id >= 0).then_some((id, e[4]))
 }
 
+/// Java biome name -> Bedrock biome id, from GeyserMC/mappings biomes.json (MIT, see data/README.md).
+static JAVA_BIOMES: &str = include_str!("../data/java_biomes.json");
+
+/// The Bedrock biome id of a Java biome (plains when Bedrock has none).
+pub fn bedrock_biome(name: &str) -> u32 {
+    static TABLE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| serde_json::from_str(JAVA_BIOMES).unwrap_or_default());
+    table[name]["bedrock_id"].as_u64().map_or(PLAINS as u32, |id| id as u32)
+}
+
 /// Java chest and trapped chest states: `state dx dz lead` per line (tools/gen_block_table.py).
 static JAVA_CHESTS: &str = include_str!("../data/java_chests.txt");
 
@@ -162,13 +172,23 @@ pub fn chest_nbt(pos: [i32; 3], state: u32) -> Option<Vec<u8>> {
 /// LevelChunk payload. Returns (sub-chunk count, payload).
 /// shortcut: every biome becomes plains; real biomes need the Java biome registry mapped to Bedrock ids.
 /// Chunk `cx, cz`: its chests' block entity data follows the payload, so Bedrock pairs double chests on load.
-pub fn java_chunk_to_bedrock(mut data: &[u8], cx: i32, cz: i32) -> Result<(u32, Vec<u8>), String> {
+/// `biomes` gives the Bedrock biome id of each Java biome id (Event::Biomes); unknown ones are plains.
+pub fn java_chunk_to_bedrock(mut data: &[u8], cx: i32, cz: i32, biomes: &[u32]) -> Result<(u32, Vec<u8>), String> {
     let mut p = Vec::new();
     let mut entities = Vec::new();
+    let mut biome_storage = Vec::new();
     for section in 0..OVERWORLD_SUBCHUNKS {
         take(&mut data, 4)?; // block count, fluid count (i16 each)
         let java = read_paletted(&mut data, 4096, 8)?; // index y<<8 | z<<4 | x
-        read_paletted(&mut data, 64, 3)?; // biomes, unused for now
+        // Biomes: 4x4x4 cells (index y<<4 | z<<2 | x); Bedrock has one per block, in its block order.
+        let cells = read_paletted(&mut data, 64, 3)?;
+        let mut biome = [0u32; 4096];
+        for (i, b) in biome.iter_mut().enumerate() {
+            let (x, z, y) = (i >> 8, (i >> 4) & 15, i & 15);
+            let java_biome = cells[(y >> 2) << 4 | (z >> 2) << 2 | (x >> 2)];
+            *b = biomes.get(java_biome as usize).copied().unwrap_or(PLAINS as u32);
+        }
+        write_storage(&mut biome_storage, &biome);
         let mut bedrock = [0u32; 4096]; // index x<<8 | z<<4 | y
         for (j, &state) in java.iter().enumerate() {
             let (y, z, x) = (j >> 8, (j >> 4) & 15, j & 15);
@@ -180,10 +200,7 @@ pub fn java_chunk_to_bedrock(mut data: &[u8], cx: i32, cz: i32) -> Result<(u32, 
         }
         write_subchunk(&mut p, section as i8 - 4, &bedrock);
     }
-    for _ in 0..OVERWORLD_SUBCHUNKS {
-        p.push(1);
-        varint(&mut p, PLAINS);
-    }
+    p.extend(biome_storage); // one biome storage per sub-chunk
     p.push(0); // no border blocks
     p.extend(entities); // block entities: network NBT compounds, one after another
     Ok((OVERWORLD_SUBCHUNKS as u32, p))
@@ -235,8 +252,14 @@ fn read_paletted(r: &mut &[u8], entries: usize, max_palette_bits: u8) -> Result<
         .collect()
 }
 
-/// Bedrock sub-chunk (version 9, one storage) with the smallest palette that fits; words never span entries.
+/// Bedrock sub-chunk (version 9, one block storage).
 fn write_subchunk(p: &mut Vec<u8>, y_index: i8, blocks: &[u32; 4096]) {
+    p.extend([9, 1, y_index as u8]);
+    write_storage(p, blocks);
+}
+
+/// A paletted storage (blocks or biomes) with the smallest palette that fits; words never span entries.
+fn write_storage(p: &mut Vec<u8>, blocks: &[u32; 4096]) {
     let mut palette: Vec<u32> = Vec::new();
     let indices: Vec<usize> = blocks
         .iter()
@@ -245,7 +268,6 @@ fn write_subchunk(p: &mut Vec<u8>, y_index: i8, blocks: &[u32; 4096]) {
             palette.len() - 1
         }))
         .collect();
-    p.extend([9, 1, y_index as u8]);
     if palette.len() == 1 {
         p.push(1); // 0 bits per block (network flag set)
         varint(p, palette[0] as i32);
@@ -348,7 +370,9 @@ mod tests {
         for s in 0..24 {
             java_section(&mut data, s == 8); // section 8 = y 64..79
         }
-        let (count, p) = java_chunk_to_bedrock(&data, 0, 0).unwrap();
+        // Java biome 0 (every cell here) is Bedrock biome 40.
+        let (count, p) = java_chunk_to_bedrock(&data, 0, 0, &[40]).unwrap();
+        assert_eq!(p[p.len() - 49..], [[1u8, 80].repeat(24), vec![0]].concat(), "24 single-biome storages, no border");
         assert_eq!(count, 24);
         let air = block_hash("minecraft:air");
         assert_eq!(&p[..4], &[9, 1, 0xFC, 1][..], "air section: single-value storage");
@@ -359,7 +383,8 @@ mod tests {
         // every 16-bit group: each word = 0b...0001_0000_0000_0000_0001 inverted (stone=0, air=1).
         let at = p.windows(4).position(|w| w == [9, 1, 4, 3]).expect("1-bit section at y index 4");
         assert_eq!(u32::from_le_bytes(p[at + 4..at + 8].try_into().unwrap()), 0xFFFE_FFFE);
-        assert!(java_chunk_to_bedrock(&data[..10], 0, 0).is_err(), "truncated data is an error, not a panic");
+        assert!(java_chunk_to_bedrock(&data[..10], 0, 0, &[]).is_err(), "truncated data is an error, not a panic");
+        assert_eq!((bedrock_biome("minecraft:plains"), bedrock_biome("minecraft:desert"), bedrock_biome("nope")), (1, 2, 1));
     }
 
     #[test]

@@ -60,6 +60,7 @@ const INVENTORY_SLOT: u32 = 50;
 const ARMOR: u32 = 120;
 const OFFHAND: u32 = 119;
 const INTERACT: u32 = 33;
+const ANIMATE: u32 = 44;
 const CONTAINER_OPEN: u32 = 46;
 const CONTAINER_CLOSE: u32 = 47;
 const CONTAINER_SET_DATA: u32 = 51;
@@ -145,6 +146,8 @@ pub struct Session {
     recipe: u32,
     /// The inventory's 2x2 crafting grid (a crafting table's grid is in `open`).
     craft: [Option<crate::java::Item>; 4],
+    /// Bedrock biome id per Java biome id (Horizon's biome registry).
+    biomes: Vec<u32>,
 }
 
 impl Default for Session {
@@ -179,6 +182,7 @@ impl Default for Session {
             crafted: false,
             recipe: 0,
             craft: [None; 4],
+            biomes: Vec::new(),
         }
     }
 }
@@ -636,7 +640,20 @@ impl Session {
                 let taker = collector.map_or(1, entity_id); // 1: our own player
                 packets.push(packet_bytes(TAKE_ITEM_ACTOR, &W::default().varuint64(entity_id(item)).varuint64(taker).0));
             }
+            // Animate: action (1 swing arm, 4 crit, 5 magic crit), runtime id, data, no swing source, hand.
+            crate::java::Event::Animate { id, action } if self.spawned && self.shown.contains_key(&id) => {
+                let (bedrock, hand) = match action {
+                    0 => (1, 0),
+                    3 => (1, 1),
+                    4 | 5 => (action, 0),
+                    _ => return Vec::new(),
+                };
+                let mut w = W::default();
+                w.u8(bedrock).varuint64(entity_id(id)).f32(0.0).bool(false).u8(hand);
+                packets.push(packet_bytes(ANIMATE, &w.0));
+            }
             crate::java::Event::Hurt(_) | crate::java::Event::Death(_) | crate::java::Event::TakeItem { .. } => {}
+            crate::java::Event::Animate { .. } => {}
             crate::java::Event::Rain(level) => {
                 let p = weather(level, 3001, 3003);
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -795,7 +812,8 @@ impl Session {
                 }
                 if self.spawned { packets.extend(p) } else { self.pending.extend(p) }
             }
-            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data, x, z) {
+            crate::java::Event::Biomes(biomes) => self.biomes = biomes,
+            crate::java::Event::Chunk { x, z, data } => match crate::world::java_chunk_to_bedrock(&data, x, z, &self.biomes) {
                 Ok((count, payload)) => {
                     let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
                     if self.spawned { packets.push(p) } else { self.pending.push(p) }
@@ -1670,6 +1688,8 @@ mod tests {
         assert_eq!(ids(moved.clone()), [MOVE_ACTOR_ABSOLUTE]);
         assert_eq!(moved[0][moved[0].len() - 3..], [0, 128, 128], "pitch, yaw and head yaw in 1/256 turns");
         assert_eq!(ids(s.on_java(Event::Hurt(Some(9)))), [ACTOR_EVENT]);
+        // A main-hand swing: Animate, action 1, runtime id 11, data 0.0, no swing source, main hand.
+        assert_eq!(s.on_java(Event::Animate { id: 9, action: 0 }), [vec![9, ANIMATE as u8, 1, 11, 0, 0, 0, 0, 0, 0]]);
         assert_eq!(ids(s.on_java(Event::RemoveEntity { id: 9, uuid: [0; 16] })), [REMOVE_ACTOR], "no player list entry");
         // An entity Bedrock has no counterpart for (Java type 85, marker) is skipped, and so are its moves.
         assert!(s.on_java(Event::AddEntity { id: 10, kind: 85, pos: [0.0; 3], yaw: 0.0, pitch: 0.0, head_yaw: 0.0 }).is_empty());
