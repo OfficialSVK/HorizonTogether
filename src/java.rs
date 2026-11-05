@@ -220,6 +220,8 @@ pub enum Command {
     CloseContainer(i32),
     /// The player wrote on a sign (sign_update): position, side, four lines.
     SignUpdate { pos: [i32; 3], front: bool, lines: [String; 4] },
+    /// Middle click on a block (pick_item_from_block): `data` also copies its block entity (ctrl in creative).
+    PickBlock { pos: [i32; 3], data: bool },
 }
 
 /// Container slots of the Java menus the bridge shows (menu registry ids, 26.3): chests and barrels (generic
@@ -1034,6 +1036,7 @@ pub async fn play(
                     }
                     Command::CloseInventory => c.send(0x13, &[0]).await?, // container_close, window 0
                     Command::SignUpdate { pos, front, lines } => c.send(0x3e, &sign_update(pos, front, &lines)).await?,
+                    Command::PickBlock { pos, data } => c.send(0x24, &[&block_pos(pos)[..], &[data as u8]].concat()).await?,
                     Command::CloseContainer(window) => {
                         if open.is_some_and(|(w, _)| w == window) {
                             open = None;

@@ -47,6 +47,7 @@ const PLAYER_AUTH_INPUT: u32 = 144;
 const UPDATE_BLOCK: u32 = 21;
 const LEVEL_EVENT: u32 = 25;
 const LEVEL_SOUND_EVENT: u32 = 123;
+const BLOCK_PICK_REQUEST: u32 = 34;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -500,6 +501,13 @@ impl Session {
                         }
                         Err(e) => eprintln!("Bedrock: can't read item stack request ({e}): {:02x?}", &raw[..raw.len().min(64)]),
                     }
+                }
+                // BlockPickRequest (middle click): block position, add block actor data, hotbar slot. Horizon picks
+                // the item (and its slot updates come back).
+                BLOCK_PICK_REQUEST if self.linked && self.spawn_status_sent => {
+                    let pos = read_block_pos(&mut packet)?;
+                    let data = packet.first() == Some(&1);
+                    self.to_java.push(crate::java::Command::PickBlock { pos, data });
                 }
                 // PlayerAction: runtime id, action, block position, result position, face.
                 PLAYER_ACTION if self.linked && self.spawn_status_sent => {
