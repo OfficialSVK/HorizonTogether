@@ -293,6 +293,9 @@ pub enum Event {
     Hurt(Option<i32>),
     /// An entity died (its death animation).
     Death(i32),
+    /// A tracked entity's metadata: (index, value) for the readable values. Indices (26.3): 0 shared flags
+    /// (bit 1 crouching), 2 custom name, 3 name visible, 16 baby (animals, villagers, zombies), 18 sheep wool.
+    EntityData { id: i32, values: Vec<(u8, Data)> },
     /// An entity's animation (Java animate actions: 0 swing main hand, 3 swing offhand, 4 crit, 5 magic crit).
     Animate { id: i32, action: u8 },
     /// A dropped item was picked up by an entity; `None` is our own player.
@@ -395,6 +398,50 @@ fn read_varint_sync(r: &mut &[u8]) -> io::Result<i32> {
         }
     }
     Err(io::Error::new(io::ErrorKind::InvalidData, "varint too long"))
+}
+
+/// An entity metadata value the bridge uses.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Data {
+    Byte(u8),
+    Bool(bool),
+    /// A text component (custom name), `None` when absent.
+    Text(Option<String>),
+    /// A value of another type, read past.
+    Other,
+}
+
+/// set_entity_data entries as (index, value), for the value types the bridge reads; reading stops at the
+/// first other type (its length can't be known).
+fn read_entity_data(mut r: &[u8]) -> Vec<(u8, Data)> {
+    let mut out = Vec::new();
+    let mut next = || -> io::Result<Option<(u8, Data)>> {
+        let index = take_bytes(&mut r, 1)?[0];
+        if index == 0xFF {
+            return Ok(None);
+        }
+        let value = match read_varint_sync(&mut r)? {
+            0 => Data::Byte(take_bytes(&mut r, 1)?[0]),
+            8 => Data::Bool(take_bytes(&mut r, 1)?[0] != 0),
+            5 => Data::Text(Some(component_text(&read_nbt(&mut r)?))),
+            6 => Data::Text(if take_bytes(&mut r, 1)?[0] != 0 { Some(component_text(&read_nbt(&mut r)?)) } else { None }),
+            // Read past: int and pose, long, float, string, item stack.
+            1 | 20 => read_varint_sync(&mut r).map(|_| Data::Other)?,
+            2 => read_varlong(&mut r).map(|_| Data::Other)?,
+            3 => take_bytes(&mut r, 4).map(|_| Data::Other)?,
+            4 => {
+                let n = read_varint_sync(&mut r)? as usize;
+                take_bytes(&mut r, n).map(|_| Data::Other)?
+            }
+            7 => read_item(&mut r).map(|_| Data::Other)?,
+            k => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("entity data type {k}"))),
+        };
+        Ok(Some((index, value)))
+    };
+    while let Ok(Some(entry)) = next() {
+        out.push(entry);
+    }
+    out
 }
 
 /// set_entity_data entries (index u8, 0xFF ends; serializer id; value) up to a dropped item's stack (index 8,
@@ -1254,9 +1301,18 @@ pub async fn play(
                 }
             }
             (State::Game, 0x65) => {
-                // set_entity_data: a waiting dropped item's stack (index 8) completes it.
+                // set_entity_data: a waiting dropped item's stack (index 8) completes it; other tracked
+                // entities report their flags, name, baby and wool values.
                 let id = read_varint_sync(&mut r)?;
-                let Some(&pos) = items_waiting.get(&id) else { continue };
+                let Some(&pos) = items_waiting.get(&id) else {
+                    if tracked.contains_key(&id) {
+                        let values = read_entity_data(r);
+                        if !values.is_empty() && events.send(Event::EntityData { id, values }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                };
                 match entity_data_item(r) {
                     Ok(Some(item)) => {
                         items_waiting.remove(&id);
@@ -1482,6 +1538,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_entity_data() {
+        // Air supply (index 1, int 300), baby (16, bool), wool (17, byte 0x1e), then the end marker.
+        let body = [1, 1, 0xac, 0x02, 16, 8, 1, 17, 0, 0x1e, 0xff];
+        assert_eq!(read_entity_data(&body), [(1, Data::Other), (16, Data::Bool(true)), (17, Data::Byte(0x1e))]);
+        // An undecoded type (9, rotations) ends the read with what came before it.
+        assert_eq!(read_entity_data(&[16, 8, 0, 5, 9, 0, 0, 0]), [(16, Data::Bool(false))]);
+    }
+
+    #[test]
     fn reads_items() {
         assert_eq!(read_item(&mut &[0][..]).unwrap(), None, "empty slot");
         // 64 stone (id 1), no components.
@@ -1588,6 +1653,7 @@ mod tests {
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),
+                Event::EntityData { id, values } => println!("entity data {id}: {values:?}"),
                 Event::Hurt(_) | Event::Death(_) | Event::TakeItem { .. } | Event::Animate { .. } => {}
                 Event::Chunk { data, .. } => {
                     crate::world::java_chunk_to_bedrock(&data, 0, 0, &[]).expect("translates");

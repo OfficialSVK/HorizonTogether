@@ -133,8 +133,9 @@ pub struct Session {
     equipment: std::collections::HashMap<i32, [Option<crate::java::Item>; 6]>,
     /// Last input flags logged (HORIZON_DEBUG_INPUT).
     debug_flags: u128,
-    /// Java entities shown on Bedrock, and as what.
+    /// Java entities shown on Bedrock, and as what; and their current actor flags once changed.
     shown: std::collections::HashMap<i32, Shown>,
+    flags: std::collections::HashMap<i32, i64>,
     /// The container window open on Bedrock (a Horizon menu), if any.
     open: Option<inventory::Open>,
     /// The inventory screen's cursor, and the creative menu's or crafting grid's output slot.
@@ -177,6 +178,7 @@ impl Default for Session {
             debug_flags: 0,
             open: None,
             shown: Default::default(),
+            flags: Default::default(),
             cursor: None,
             created: None,
             crafted: false,
@@ -581,13 +583,12 @@ impl Session {
             }
             crate::java::Event::AddEntity { id, kind, pos, yaw, pitch, head_yaw } => {
                 let Some(identifier) = crate::world::bedrock_entity(kind) else { return Vec::new() };
-                self.shown.insert(id, Shown::Actor);
+                self.shown.insert(id, Shown::Actor(identifier));
                 let p = packet_bytes(ADD_ACTOR, &add_actor(entity_id(id), identifier, pos, yaw, pitch, head_yaw));
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
             crate::java::Event::AddItem { id, item, pos } => {
-                println!("Bedrock: showing dropped item {id} ({item:?}) at {pos:.1?}{}", if self.spawned { "" } else { " (with the spawn)" });
-                self.shown.insert(id, Shown::Actor);
+                self.shown.insert(id, Shown::Actor("minecraft:item"));
                 let rid = entity_id(id);
                 let mut w = W::default();
                 w.varint64(rid as i64).varuint64(rid);
@@ -603,7 +604,7 @@ impl Session {
             }
             crate::java::Event::MoveEntity { id, pos, yaw, pitch, head_yaw } if self.spawned => match self.shown.get(&id) {
                 Some(Shown::Player) => packets.push(move_entity(entity_id(id), pos, pitch, yaw, head_yaw)),
-                Some(Shown::Actor) => {
+                Some(Shown::Actor(_)) => {
                     // MoveActorAbsolute: runtime id, flags, position (feet), pitch, yaw, head yaw as 1/256 turns.
                     let turn = |a: f32| (a.rem_euclid(360.0) / 360.0 * 256.0) as u8;
                     let mut w = W::default();
@@ -616,6 +617,7 @@ impl Session {
             crate::java::Event::MoveEntity { .. } => {}
             crate::java::Event::RemoveEntity { id, uuid } => {
                 self.equipment.remove(&id);
+                self.flags.remove(&id);
                 let Some(shown) = self.shown.remove(&id) else { return Vec::new() };
                 packets.push(packet_bytes(REMOVE_ACTOR, &W::default().varint64(entity_id(id) as i64).0));
                 if shown == Shown::Player {
@@ -639,6 +641,53 @@ impl Session {
             crate::java::Event::TakeItem { item, collector } if self.spawned && self.shown.contains_key(&item) => {
                 let taker = collector.map_or(1, entity_id); // 1: our own player
                 packets.push(packet_bytes(TAKE_ITEM_ACTOR, &W::default().varuint64(entity_id(item)).varuint64(taker).0));
+            }
+            // Metadata: sneaking, custom names, baby mobs and sheep wool, as SetActorData (entries in key order).
+            crate::java::Event::EntityData { id, values } => {
+                use crate::java::Data;
+                let Some(&shown) = self.shown.get(&id) else { return Vec::new() };
+                let kind = match shown {
+                    Shown::Player => "minecraft:player",
+                    Shown::Actor(k) => k,
+                };
+                let mut flags = self.flags.get(&id).copied().unwrap_or(BASE_FLAGS);
+                let set = |flags: &mut i64, bit: i64, on: bool| if on { *flags |= bit } else { *flags &= !bit };
+                let mut entries = std::collections::BTreeMap::new();
+                for (index, value) in values {
+                    let mut e = W::default();
+                    match (index, value) {
+                        (0, Data::Byte(b)) => set(&mut flags, FLAG_SNEAKING, b & 2 != 0),
+                        (2, Data::Text(name)) if shown != Shown::Player => {
+                            e.meta(4, 4).string(&name.unwrap_or_default());
+                            entries.insert(4, e.0);
+                        }
+                        (3, Data::Bool(v)) if shown != Shown::Player => set(&mut flags, FLAG_SHOW_NAME | FLAG_ALWAYS_SHOW_NAME, v),
+                        (16, Data::Bool(baby)) if BABY_AT_16.contains(&kind) => {
+                            set(&mut flags, FLAG_BABY, baby);
+                            e.meta(38, 3).f32(if baby { 0.5 } else { 1.0 }); // scale
+                            entries.insert(38, e.0);
+                        }
+                        // Java wool (index 18 in 26.3): dye colour (Bedrock's colour index order), 0x10 sheared.
+                        (18, Data::Byte(w)) if kind == "minecraft:sheep" => {
+                            set(&mut flags, FLAG_SHEARED, w & 0x10 != 0);
+                            e.meta(3, 0).u8(w & 15);
+                            entries.insert(3, e.0);
+                        }
+                        _ => {}
+                    }
+                }
+                self.flags.insert(id, flags);
+                let mut f = W::default();
+                f.meta(0, 7).varint64(flags);
+                entries.insert(0, f.0);
+                let mut w = W::default();
+                w.varuint64(entity_id(id)).varuint(entries.len() as u32);
+                for e in entries.values() {
+                    w.bytes(e);
+                }
+                w.varuint(0).varuint(0).varuint64(0); // no synced properties, tick
+                let p = packet_bytes(SET_ACTOR_DATA, &w.0);
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
             // Animate: action (1 swing arm, 4 crit, 5 magic crit), runtime id, data, no swing source, hand.
             crate::java::Event::Animate { id, action } if self.spawned && self.shown.contains_key(&id) => {
@@ -1074,7 +1123,7 @@ fn player_metadata() -> Vec<u8> {
     const SHORT: u8 = 1;
     const FLOAT: u8 = 3;
     const LONG: u8 = 7;
-    let flags: i64 = 1 << 19 | 1 << 35 | 1 << 48 | 1 << 49; // can climb, breathing, has collision, has gravity
+    let flags: i64 = BASE_FLAGS;
     let mut w = W::default();
     w.varuint64(1).varuint(5); // runtime id, 5 entries
     w.meta(0, LONG).varint64(flags);
@@ -1086,12 +1135,33 @@ fn player_metadata() -> Vec<u8> {
     w.0
 }
 
-/// How a Java entity is shown on Bedrock.
+/// How a Java entity is shown on Bedrock: a player, or an actor with its Bedrock identifier.
 #[derive(Clone, Copy, PartialEq)]
 enum Shown {
     Player,
-    Actor,
+    Actor(&'static str),
 }
+
+/// Actor flags every shown entity starts with: gravity, collision, breathing, climbing (as for players).
+const BASE_FLAGS: i64 = 1 << 19 | 1 << 35 | 1 << 48 | 1 << 49;
+/// Bedrock actor flag bits (gophertunnel's EntityDataFlag order).
+const FLAG_SNEAKING: i64 = 1 << 1;
+const FLAG_BABY: i64 = 1 << 11;
+const FLAG_SHOW_NAME: i64 = 1 << 14;
+const FLAG_ALWAYS_SHOW_NAME: i64 = 1 << 15;
+const FLAG_SHEARED: i64 = 1 << 31;
+
+/// Mobs whose Java metadata index 16 is "baby" (AgeableMob and Zombie subclasses). shortcut: piglins (17)
+/// and the few others with their baby flag elsewhere stay grown; add them by their index when needed.
+const BABY_AT_16: &[&str] = &[
+    "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:mooshroom",
+    "minecraft:rabbit", "minecraft:horse", "minecraft:donkey", "minecraft:mule", "minecraft:llama",
+    "minecraft:trader_llama", "minecraft:wolf", "minecraft:cat", "minecraft:ocelot", "minecraft:fox",
+    "minecraft:panda", "minecraft:polar_bear", "minecraft:bee", "minecraft:turtle", "minecraft:goat",
+    "minecraft:axolotl", "minecraft:camel", "minecraft:sniffer", "minecraft:armadillo", "minecraft:strider",
+    "minecraft:hoglin", "minecraft:villager_v2", "minecraft:villager", "minecraft:zombie", "minecraft:husk",
+    "minecraft:drowned", "minecraft:zombie_villager_v2", "minecraft:zombie_villager", "minecraft:zombie_pigman",
+];
 
 /// AddActor for a mob, projectile or vehicle at a Java feet position.
 fn add_actor(rid: u64, identifier: &str, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32) -> Vec<u8> {
@@ -1102,7 +1172,7 @@ fn add_actor(rid: u64, identifier: &str, pos: [f64; 3], yaw: f32, pitch: f32, he
     w.varuint(0); // no attributes
     // metadata: flags (gravity, collision, breathing, climb, as for players) and scale 1
     w.varuint(2);
-    w.meta(0, 7).varint64(1 << 19 | 1 << 35 | 1 << 48 | 1 << 49);
+    w.meta(0, 7).varint64(BASE_FLAGS);
     w.meta(38, 3).f32(1.0);
     w.varuint(0).varuint(0).varuint(0).bool(false); // no synced properties, no links, not riding a block
     w.0
@@ -1175,7 +1245,7 @@ fn add_player(uuid: &[u8; 16], id: u64, name: &str, pos: [f64; 3], yaw: f32, pit
     w.varint(0); // game type
     // metadata: flags (gravity, collision, breathing, climb) and bounding box; no synced properties
     w.varuint(3);
-    w.meta(0, 7).varint64(1 << 19 | 1 << 35 | 1 << 48 | 1 << 49);
+    w.meta(0, 7).varint64(BASE_FLAGS);
     w.meta(53, 3).f32(0.6).meta(54, 3).f32(1.8);
     w.varuint(0).varuint(0);
     w.bytes(&(id as i64).to_le_bytes()).u8(1).u8(0).varuint(0); // abilities: unique id, member, any, no layers
@@ -1688,6 +1758,20 @@ mod tests {
         assert_eq!(ids(moved.clone()), [MOVE_ACTOR_ABSOLUTE]);
         assert_eq!(moved[0][moved[0].len() - 3..], [0, 128, 128], "pitch, yaw and head yaw in 1/256 turns");
         assert_eq!(ids(s.on_java(Event::Hurt(Some(9)))), [ACTOR_EVENT]);
+        // A baby, sheared, red sheep (Java 16 baby, 18 wool 14 | 0x10, as Horizon sent them): flags, colour 14,
+        // scale 0.5, key order.
+        s.shown.insert(20, Shown::Actor("minecraft:sheep"));
+        let data = vec![(16, crate::java::Data::Bool(true)), (18, crate::java::Data::Byte(0x1e))];
+        let p = s.on_java(Event::EntityData { id: 20, values: data });
+        let mut want = W::default();
+        want.varuint64(22).varuint(3).meta(0, 7).varint64(BASE_FLAGS | FLAG_BABY | FLAG_SHEARED);
+        want.meta(3, 0).u8(14).meta(38, 3).f32(0.5).varuint(0).varuint(0).varuint64(0);
+        assert_eq!(p[0][2..], want.0[..], "SetActorData after the batch length and packet id");
+        // A Java player crouching (shared flags bit 1) sneaks on Bedrock; its name isn't touched.
+        s.shown.insert(21, Shown::Player);
+        let p = s.on_java(Event::EntityData { id: 21, values: vec![(0, crate::java::Data::Byte(2)), (2, crate::java::Data::Text(None))] });
+        assert_eq!(s.flags[&21] & FLAG_SNEAKING, FLAG_SNEAKING);
+        assert_eq!(ids(p), [SET_ACTOR_DATA]);
         // A main-hand swing: Animate, action 1, runtime id 11, data 0.0, no swing source, main hand.
         assert_eq!(s.on_java(Event::Animate { id: 9, action: 0 }), [vec![9, ANIMATE as u8, 1, 11, 0, 0, 0, 0, 0, 0]]);
         assert_eq!(ids(s.on_java(Event::RemoveEntity { id: 9, uuid: [0; 16] })), [REMOVE_ACTOR], "no player list entry");
