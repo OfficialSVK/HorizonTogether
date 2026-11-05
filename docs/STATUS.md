@@ -19,7 +19,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Movement and game mode | Bedrock movement moves the Java player (one position per tick, ground state from Bedrock's collision flag), new terrain loads as you walk, and Horizon's game mode is applied on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
 | Chat and commands | Chat goes both ways; Bedrock commands run on Horizon, and their replies show on Bedrock. | `src/bedrock.rs`, `src/java.rs` |
 | Other players | Java players appear on Bedrock (name tag, generated Steve-shaped skin), move, and disappear when they leave. What they hold and their armour are shown. | `src/bedrock.rs`, `src/java.rs` |
-| Blocks | Breaking (creative and survival, with tools) and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
+| Blocks | Breaking (creative and survival, with tools; the crack animation runs at Java's mining speed) and placing on Bedrock happen on Horizon, and block changes on Horizon update Bedrock. Right-clicks on blocks are forwarded (doors, levers). | `src/bedrock.rs`, `src/java.rs` |
 | Crafting | The inventory's 2x2 grid and crafting tables: Bedrock shows results from its own recipes, and Horizon crafts (grid filled and result taken with Java clicks). | `data/crafting_data.bin`, `tools/gen_recipes.py` |
 | Signs | Sign and hanging sign text shows on Bedrock, and writing on a sign from Bedrock reaches Horizon (Bedrock's own sign editor). | `src/world.rs`, `src/java.rs` |
 | Containers | Chests (double chests paired the Java way, also after a relog), barrels, shulker boxes, dispensers, droppers, hoppers and furnaces (with their progress) open, and moving or shift-clicking items in them reaches Horizon. | `src/bedrock/inventory.rs`, `data/java_chests.txt` |
@@ -29,7 +29,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 43 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 44 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 

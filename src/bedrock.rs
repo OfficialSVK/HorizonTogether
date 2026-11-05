@@ -154,6 +154,11 @@ pub struct Session {
     editing: Option<([i32; 3], bool)>,
     /// Bedrock enchantment id per Java enchantment id (Horizon's registry); -1 when Bedrock has none.
     enchants: Vec<i16>,
+    /// Horizon's chunks near the player (their section data) and the blocks changed since, so the block being
+    /// mined is known (its crack animation's speed).
+    chunks: std::collections::HashMap<(i32, i32), Vec<u8>>,
+    changed: std::collections::HashMap<[i32; 3], u32>,
+    on_ground: bool,
 }
 
 impl Default for Session {
@@ -192,6 +197,9 @@ impl Default for Session {
             biomes: Vec::new(),
             editing: None,
             enchants: Vec::new(),
+            chunks: Default::default(),
+            changed: Default::default(),
+            on_ground: true,
         }
     }
 }
@@ -397,6 +405,7 @@ impl Session {
                         let new_chunk = chunk([x, y, z]) != chunk(self.pos);
                         // Java's on_ground: Bedrock's VerticalCollision input flag, while not moving up.
                         let on_ground = flags & (1 << 50) != 0 && y <= self.pos[1];
+                        self.on_ground = on_ground;
                         self.pos = [x, y, z];
                         self.rot = [pitch, yaw];
                         self.to_java.push(crate::java::Command::Move {
@@ -417,7 +426,10 @@ impl Session {
                                     let response = self.stack_requests(vec![req]);
                                     out.push(self.batch(&[response]));
                                 }
-                                actions.into_iter().for_each(|(a, pos, face)| self.block_action(a, pos, face));
+                                let cracks: Vec<_> = actions.into_iter().flat_map(|(a, pos, face)| self.block_action(a, pos, face)).collect();
+                                if !cracks.is_empty() {
+                                    out.push(self.batch(&cracks));
+                                }
                             }
                             Err(e) => {
                                 let ids: Vec<u32> = (0..128).filter(|b| flags & 1 << b != 0).collect();
@@ -491,7 +503,10 @@ impl Session {
                     let pos = read_block_pos(&mut packet)?;
                     read_block_pos(&mut packet)?;
                     let face = zigzag(read_uvarint(&mut packet)?);
-                    self.block_action(action, pos, face);
+                    let cracks = self.block_action(action, pos, face);
+                    if !cracks.is_empty() {
+                        out.push(self.batch(&cracks));
+                    }
                 }
                 INVENTORY_TRANSACTION if self.linked && self.spawn_status_sent => {
                     let raw = packet;
@@ -869,6 +884,7 @@ impl Session {
                 }
             }
             crate::java::Event::Block { pos, state } => {
+                self.changed.insert(pos, state);
                 // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
                 let mut w = W::default();
                 w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
@@ -895,17 +911,24 @@ impl Session {
                 packets.push(packet_bytes(OPEN_SIGN, &w.0));
             }
             crate::java::Event::OpenSign { .. } => {}
-            crate::java::Event::Chunk { x, z, data, signs } => match crate::world::java_chunk_to_bedrock(&data, x, z, &self.biomes) {
-                Ok((count, mut payload)) => {
-                    // Block entities end the payload, so the signs' data goes after the chests'.
-                    for s in signs {
-                        payload.extend(crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
+            crate::java::Event::Chunk { x, z, data, signs } => {
+                match crate::world::java_chunk_to_bedrock(&data, x, z, &self.biomes) {
+                    Ok((count, mut payload)) => {
+                        // Block entities end the payload, so the signs' data goes after the chests'.
+                        for s in signs {
+                            payload.extend(crate::world::sign_nbt(s.pos, s.hanging, &s.front, &s.back));
+                        }
+                        let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
+                        if self.spawned { packets.push(p) } else { self.pending.push(p) }
                     }
-                    let p = packet_bytes(LEVEL_CHUNK, &level_chunk(x, z, count, &payload));
-                    if self.spawned { packets.push(p) } else { self.pending.push(p) }
+                    Err(e) => eprintln!("Bedrock: can't translate Horizon chunk {x},{z}: {e}"),
                 }
-                Err(e) => eprintln!("Bedrock: can't translate Horizon chunk {x},{z}: {e}"),
-            },
+                // Keep it (forgetting far ones: Horizon's unloads aren't read) and drop older changes inside it.
+                self.chunks.retain(|&(cx, cz), _| (cx - x).abs().max((cz - z).abs()) <= 32); // chunks come around the player
+                self.chunks.insert((x, z), data);
+                let chunks = &self.chunks;
+                self.changed.retain(|p, _| (p[0] >> 4, p[2] >> 4) != (x, z) && chunks.contains_key(&(p[0] >> 4, p[2] >> 4)));
+            }
         }
         if packets.is_empty() { Vec::new() } else { vec![self.batch(&packets)] }
     }
@@ -989,42 +1012,69 @@ impl Session {
 
     /// A Bedrock block action (server-authoritative breaking) as Java digging. Java creative breaks on "start";
     /// survival needs "start", then "finish" once the block is predicted broken.
-    fn block_action(&mut self, action: i32, pos: [i32; 3], face: i32) {
+    /// Returns LevelEvents starting or stopping Bedrock's crack animation (survival).
+    fn block_action(&mut self, action: i32, pos: [i32; 3], face: i32) -> Vec<Vec<u8>> {
         use crate::java::{DIG_ABORT, DIG_FINISH, DIG_START};
-        let status = match action {
+        let mut cracks = Vec::new();
+        let (status, pos) = match action {
             // "Continue" repeats every tick while the button is held: only a new block restarts Java's dig timer.
-            START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK if self.breaking == Some(pos) => return,
+            START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK if self.breaking == Some(pos) => return cracks,
             START_DESTROY_BLOCK | CONTINUE_DESTROY_BLOCK => {
-                self.breaking = Some(pos);
-                DIG_START
+                if let Some(old) = self.breaking.replace(pos) {
+                    cracks.push(crack(old, None)); // moved on to another block
+                }
+                (DIG_START, pos)
             }
+            // Nothing being dug: the client aborts after a finished break too.
             ABORT_DESTROY_BLOCK => match self.breaking.take() {
-                Some(started) => return self.dig(action, DIG_ABORT, started, face),
-                None => return, // nothing being dug (the client aborts after a finished break too)
+                Some(started) => (DIG_ABORT, started),
+                None => return cracks,
             },
             // Survival break of a block never started (instant-break blocks): Java breaks those on "start".
             PREDICT_DESTROY_BLOCK if self.game_mode != 1 && self.breaking != Some(pos) => {
                 self.breaking = None;
-                DIG_START
+                (DIG_START, pos)
             }
             CREATIVE_DESTROY_BLOCK | PREDICT_DESTROY_BLOCK if self.game_mode == 1 => {
                 if self.breaking.take() == Some(pos) {
-                    return; // already broken by "start"
+                    return cracks; // already broken by "start"
                 }
-                DIG_START
+                (DIG_START, pos)
             }
             PREDICT_DESTROY_BLOCK => {
                 self.breaking = None;
-                DIG_FINISH
+                (DIG_FINISH, pos)
             }
             // PlayerAction's stop has no position: finish the block we started on.
             STOP_DESTROY_BLOCK if self.game_mode != 1 => match self.breaking.take() {
-                Some(started) => return self.dig(action, DIG_FINISH, started, face),
-                None => return,
+                Some(started) => (DIG_FINISH, started),
+                None => return cracks,
             },
-            _ => return, // crack progress, stop
+            _ => return cracks, // crack progress, stop
         };
         self.dig(action, status, pos, face);
+        if self.game_mode == 1 {
+            return Vec::new();
+        }
+        if self.breaking != Some(pos) {
+            cracks.push(crack(pos, None));
+        } else if let Some(ticks) = self.break_ticks(pos).filter(|t| *t > 1) {
+            cracks.push(crack(pos, Some(ticks)));
+        }
+        cracks
+    }
+
+    /// How many ticks Java takes to mine the block at `pos` with the held item.
+    fn break_ticks(&self, pos: [i32; 3]) -> Option<u32> {
+        let state = self.changed.get(&pos).copied().or_else(|| {
+            let data = self.chunks.get(&(pos[0] >> 4, pos[2] >> 4))?;
+            crate::world::java_state_at(data, (pos[0] & 15) as usize, pos[1], (pos[2] & 15) as usize)
+        })?;
+        let item = self.inventory[self.held as usize];
+        let efficiency = item.map_or(0, |i| {
+            (i.ench.iter()).find(|e| e.1 > 0 && self.enchants.get(e.0 as usize) == Some(&15)).map_or(0, |e| e.1)
+        });
+        crate::world::break_ticks(state, item.map(|i| i.id), efficiency, self.on_ground)
     }
 
     fn dig(&mut self, action: i32, status: i32, pos: [i32; 3], face: i32) {
@@ -1314,6 +1364,15 @@ fn move_entity(id: u64, pos: [f64; 3], pitch: f32, yaw: f32, head_yaw: f32) -> V
 /// PlayerHotbar: select a hotbar slot of the inventory.
 fn hotbar(slot: u8) -> Vec<u8> {
     packet_bytes(PLAYER_HOTBAR, &W::default().varuint(slot as u32).u8(0).bool(true).0)
+}
+
+/// LevelEvent starting Bedrock's crack animation on a block (taking `ticks` to finish), or stopping it (None).
+/// Event ids from gophertunnel: start block cracking 3600, stop 3601; the start's data is 65535 / ticks.
+fn crack(pos: [i32; 3], ticks: Option<u32>) -> Vec<u8> {
+    let mut w = W::default();
+    w.varint(if ticks.is_some() { 3600 } else { 3601 }).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
+    w.varint(ticks.map_or(0, |t| (65535 / t.max(1)) as i32));
+    packet_bytes(LEVEL_EVENT, &w.0)
 }
 
 /// LevelEvent starting (strength 0..1 scaled to 0..65535) or stopping rain or thunder. Event ids from gophertunnel:
@@ -1783,6 +1842,23 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn times_mining_like_java() {
+        use crate::world::{break_ticks, java_state_at};
+        let (stone, dirt, obsidian, bedrock) = (1, 10, 4925, 88); // Java 26.3 state ids
+        let (wooden_pickaxe, iron_pickaxe) = (Some(1027), Some(1047));
+        assert_eq!(break_ticks(stone, None, 0, true), Some(150), "wrong tool: 1 / 1.5 / 100");
+        assert_eq!(break_ticks(stone, wooden_pickaxe, 0, true), Some(23));
+        assert_eq!(break_ticks(stone, wooden_pickaxe, 0, false), Some(113), "off the ground: a fifth as fast");
+        assert_eq!(break_ticks(dirt, None, 0, true), Some(15));
+        assert_eq!(break_ticks(obsidian, iron_pickaxe, 0, true), Some(834), "iron can't harvest obsidian");
+        assert_eq!(break_ticks(stone, iron_pickaxe, 5, true), Some(2), "efficiency V adds 26");
+        assert_eq!(break_ticks(bedrock, None, 0, true), None);
+        // A chunk of single-value sections, stone in the one for y 0..15.
+        let chunk: Vec<u8> = (0..24).flat_map(|s| [0, 0, 0, 0, 0, (s == 4) as u8, 0, 0]).collect();
+        assert_eq!((java_state_at(&chunk, 3, 5, 7), java_state_at(&chunk, 0, -64, 0)), (Some(1), Some(0)));
+    }
 
     #[test]
     fn stacks_carry_damage_and_enchantments() {
