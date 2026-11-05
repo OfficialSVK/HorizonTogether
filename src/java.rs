@@ -317,6 +317,8 @@ pub enum Event {
     AddEntity { id: i32, kind: i32, pos: [f64; 3], yaw: f32, pitch: f32, head_yaw: f32 },
     /// A dropped item stack appeared.
     AddItem { id: i32, item: Item, pos: [f64; 3] },
+    /// Someone else broke a block (its particles and sound): position and the state it was.
+    BlockBroken { pos: [i32; 3], state: u32 },
     /// An entity was hurt (its red flash); `None` is our own player.
     Hurt(Option<i32>),
     /// An entity died (its death animation).
@@ -1498,6 +1500,14 @@ pub async fn play(
                     }
                 }
             }
+            // level_event: kind (i32), position, data (i32), global. 2001: another player broke a block (data: its state).
+            (State::Game, 0x2f) if body.get(..4) == Some(&2001i32.to_be_bytes()[..]) => {
+                let pos = read_block_pos(&mut &body[4..])?;
+                let state = i32::from_be_bytes(take_bytes(&mut &body[12..], 4)?.try_into().unwrap()) as u32;
+                if events.send(Event::BlockBroken { pos, state }).is_err() {
+                    return Ok(());
+                }
+            }
             (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
             (State::Game, 0x3e) => c.send(0x2d, &body).await?, // ping -> pong
             (State::Game, 0x49) => {
@@ -1832,7 +1842,7 @@ mod tests {
                 Event::GameMode(m) => println!("game mode {m}"),
                 Event::Chat { from, text, .. } => println!("chat from {from:?}: {text}"),
                 Event::AddPlayer { name, pos, .. } => println!("player {name} at {pos:?}"),
-                Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } => {}
+                Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } | Event::BlockBroken { .. } => {}
                 Event::Rain(v) => println!("rain {v}"),
                 Event::Thunder(v) => println!("thunder {v}"),
                 Event::Time(t) => println!("time {t}"),

@@ -896,6 +896,8 @@ impl Session {
                 }
                 if self.spawned { packets.extend(p) } else { self.pending.extend(p) }
             }
+            crate::java::Event::BlockBroken { pos, state } if self.spawned => packets.push(destroyed(pos, state)),
+            crate::java::Event::BlockBroken { .. } => {}
             crate::java::Event::Biomes(biomes) => self.biomes = biomes,
             crate::java::Event::Enchantments(names) => self.enchants = names.iter().map(|n| bedrock_enchantment(n)).collect(),
             crate::java::Event::Sign(s) => {
@@ -1053,8 +1055,14 @@ impl Session {
             _ => return cracks, // crack progress, stop
         };
         self.dig(action, status, pos, face);
+        // The block breaks now: Bedrock waits for the server's particles and sound, in creative too (Java clients
+        // make their own, so Horizon doesn't send them to us).
+        let broken = status == DIG_FINISH || status == DIG_START && (self.game_mode == 1 || action == PREDICT_DESTROY_BLOCK);
+        if let Some(state) = self.state_at(pos).filter(|_| broken) {
+            cracks.push(destroyed(pos, state));
+        }
         if self.game_mode == 1 {
-            return Vec::new();
+            return cracks;
         }
         if self.breaking != Some(pos) {
             cracks.push(crack(pos, None));
@@ -1064,12 +1072,17 @@ impl Session {
         cracks
     }
 
-    /// How many ticks Java takes to mine the block at `pos` with the held item.
-    fn break_ticks(&self, pos: [i32; 3]) -> Option<u32> {
-        let state = self.changed.get(&pos).copied().or_else(|| {
+    /// The Java block state at `pos`, as Horizon last sent it.
+    fn state_at(&self, pos: [i32; 3]) -> Option<u32> {
+        self.changed.get(&pos).copied().or_else(|| {
             let data = self.chunks.get(&(pos[0] >> 4, pos[2] >> 4))?;
             crate::world::java_state_at(data, (pos[0] & 15) as usize, pos[1], (pos[2] & 15) as usize)
-        })?;
+        })
+    }
+
+    /// How many ticks Java takes to mine the block at `pos` with the held item.
+    fn break_ticks(&self, pos: [i32; 3]) -> Option<u32> {
+        let state = self.state_at(pos)?;
         let item = self.inventory[self.held as usize];
         let efficiency = item.map_or(0, |i| {
             (i.ench.iter()).find(|e| e.1 > 0 && self.enchants.get(e.0 as usize) == Some(&15)).map_or(0, |e| e.1)
@@ -1372,6 +1385,14 @@ fn crack(pos: [i32; 3], ticks: Option<u32>) -> Vec<u8> {
     let mut w = W::default();
     w.varint(if ticks.is_some() { 3600 } else { 3601 }).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
     w.varint(ticks.map_or(0, |t| (65535 / t.max(1)) as i32));
+    packet_bytes(LEVEL_EVENT, &w.0)
+}
+
+/// LevelEvent 2001 (particles destroy block): a block's break particles and sound; data is its Bedrock block id.
+fn destroyed(pos: [i32; 3], java_state: u32) -> Vec<u8> {
+    let mut w = W::default();
+    w.varint(2001).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
+    w.varint(crate::world::java_block(java_state) as i32);
     packet_bytes(LEVEL_EVENT, &w.0)
 }
 
