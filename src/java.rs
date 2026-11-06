@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 mod components;
+pub mod commands;
 
 /// Java Edition 26.3 (from MCProtocolLib's MinecraftCodec, which Geyser uses).
 pub const PROTOCOL: i32 = 777;
@@ -367,8 +368,8 @@ pub enum Event {
     Biomes(Vec<u32>),
     /// The enchantment registry's names, in id order.
     Enchantments(Vec<String>),
-    /// The top-level commands the player may run.
-    Commands(Vec<String>),
+    /// The top-level commands the player may run, with their usages.
+    Commands(Vec<commands::Usage>),
     /// A mob variant registry (cat, wolf, frog, pig, cow, chicken) in id order.
     Variants { registry: String, names: Vec<String> },
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
@@ -1613,13 +1614,21 @@ pub async fn play(
                     return Ok(());
                 }
             }
-            // commands (the command tree, sent again when permissions change): rather than decode the graph, ask
-            // for completions of "/", which are the top-level commands this player may run.
-            (State::Game, 0x10) => {
-                let mut ask = vec![COMMANDS_TRANSACTION as u8];
-                write_string(&mut ask, "/");
-                c.send(0x0f, &ask).await?;
-            }
+            // commands (the command tree, sent again when permissions change). If it can't be read, ask for the
+            // completions of "/" instead: the top-level commands this player may run, without their arguments.
+            (State::Game, 0x10) => match commands::read(&body) {
+                Ok(usages) => {
+                    if events.send(Event::Commands(usages)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Java: command tree not read ({e}); Bedrock gets the command names only");
+                    let mut ask = vec![COMMANDS_TRANSACTION as u8];
+                    write_string(&mut ask, "/");
+                    c.send(0x0f, &ask).await?;
+                }
+            },
             // command_suggestions: transaction id, start, length, then (match, optional tooltip component).
             (State::Game, 0x0f) if read_varint_sync(&mut r)? == COMMANDS_TRANSACTION => {
                 read_varint_sync(&mut r)?;
@@ -1627,7 +1636,8 @@ pub async fn play(
                 let mut names = Vec::new();
                 for _ in 0..read_varint_sync(&mut r)? {
                     let n = read_varint_sync(&mut r)? as usize;
-                    names.push(String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned());
+                    let name = String::from_utf8_lossy(take_bytes(&mut r, n)?).into_owned();
+                    names.push(commands::Usage { name, usages: None });
                     if take_bytes(&mut r, 1)?[0] != 0 {
                         read_nbt(&mut r)?;
                     }
@@ -2028,7 +2038,7 @@ mod tests {
                 Event::Biomes(b) => println!("{} biomes: {b:?}", b.len()),
                 Event::Enchantments(e) => println!("{} enchantments: {e:?}", e.len()),
                 Event::Variants { registry, names } => println!("{registry}: {names:?}"),
-                Event::Commands(names) => println!("{} commands: {names:?}", names.len()),
+                Event::Commands(c) => println!("{} commands: {:?}", c.len(), c.iter().map(|u| (&u.name, u.usages.as_ref().map(Vec::len))).collect::<Vec<_>>()),
                 Event::ContainerContent { .. } | Event::ContainerSlot { .. } | Event::ContainerData { .. } | Event::CloseContainer(_) => {}
                 Event::AddEntity { id, kind, pos, .. } => println!("entity {id} type {kind} at {pos:?}"),
                 Event::AddItem { id, item, pos } => println!("item entity {id} {item:?} at {pos:?}"),

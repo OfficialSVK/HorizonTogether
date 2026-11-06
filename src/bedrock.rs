@@ -168,7 +168,7 @@ pub struct Session {
     /// Bedrock variant per Java registry id, by registry (cat, wolf, frog variants).
     variants: std::collections::HashMap<String, Vec<i32>>,
     /// Horizon's top-level commands for this player (Bedrock's command list and autocomplete).
-    commands: Vec<String>,
+    commands: Vec<crate::java::commands::Usage>,
 }
 
 impl Default for Session {
@@ -1009,9 +1009,10 @@ impl Session {
             crate::java::Event::Commands(names) => {
                 println!("Bedrock: {} commands from Horizon", names.len());
                 self.commands = names;
-                if self.spawned {
-                    packets.push(packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands)));
-                }
+                // Horizon's tree can come after StartGame went out but before the spawn: then it goes with the
+                // spawn's packets (it was dropped, leaving the client with its built-in commands only).
+                let p = packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands));
+                if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
             crate::java::Event::Variants { registry, names } => {
                 let ids = names.iter().map(|n| bedrock_variant(&registry, n)).collect();
@@ -1805,20 +1806,116 @@ fn read_stack(r: &mut &[u8]) -> Result<(i16, u16), String> {
 /// Bedrock item id of minecraft:shield (26.60), whose user data has an extra blocking tick.
 const SHIELD: i16 = 358;
 
-/// AvailableCommands (layout from gophertunnel): no enum values, chained subcommand values, suffixes, enums or
-/// chained subcommands; then each command (name, description, flags, permission, no aliases, no chained
-/// subcommands) with one overload taking optional raw text; no dynamic enums or constraints.
-/// shortcut: arguments aren't described (Bedrock completes names only); that needs Java's command graph translated.
-fn available_commands(names: &[String]) -> Vec<u8> {
-    const RAW_TEXT: u32 = 0x10_0000 | 70; // valid argument, raw text (the rest of the line)
-    let names: Vec<_> = (names.iter())
-        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b)))
+/// Bedrock command argument types (gophertunnel's CommandArgType), marked valid; an enum argument is
+/// `ENUM | index`.
+const VALID: u32 = 0x10_0000;
+const ENUM: u32 = VALID | 0x20_0000;
+const RAW_TEXT: u32 = VALID | 70; // the rest of the line
+
+/// A Java argument as Bedrock's type, or as an enum (its name and values).
+fn bedrock_arg(parser: &str, greedy: bool) -> Result<u32, (&'static str, &'static [&'static str])> {
+    Ok(VALID
+        | match parser {
+            "brigadier:bool" => return Err(("Boolean", &["true", "false"])),
+            // Not "GameMode": the client's own enum of that name has other values (default, d, c...).
+            "minecraft:gamemode" => return Err(("JavaGameMode", &["survival", "creative", "adventure", "spectator"])),
+            _ if greedy => 70, // raw text
+            "brigadier:integer" | "brigadier:long" => 1,
+            "brigadier:float" | "brigadier:double" | "minecraft:angle" => 3,
+            "minecraft:entity" | "minecraft:game_profile" => 8,  // target
+            "minecraft:score_holder" => 10,                       // wildcard target
+            "minecraft:block_pos" | "minecraft:column_pos" => 64, // block position
+            "minecraft:vec3" => 65,                               // position
+            _ => 56,                                              // string (one word)
+        })
+}
+
+/// AvailableCommands (layout from gophertunnel): enum values, no chained subcommand values or suffixes, enums (name,
+/// value indices), no chained subcommands; then each command (name, description, flags, permission, no aliases, no
+/// chained subcommands) with its usages as overloads (fixed words as one-value enums), plus one taking optional raw
+/// text, so a line Bedrock's own check doesn't know (Java item data, `execute`) still goes to Horizon; no dynamic
+/// enums or constraints.
+fn available_commands(commands: &[crate::java::commands::Usage]) -> Vec<u8> {
+    use crate::java::commands::Arg;
+    // The client has its own `help` (and `?`, `gametips`); the official server doesn't send them.
+    let commands: Vec<_> = (commands.iter())
+        .filter(|c| !c.name.is_empty() && c.name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b)))
+        .filter(|c| !matches!(c.name.as_str(), "help" | "gametips"))
         .collect();
+    let mut values: Vec<String> = Vec::new();
+    let mut enums: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut enum_type = |name: &str, vals: &[&str]| -> u32 {
+        let i = enums.iter().position(|(n, _)| n == name).unwrap_or_else(|| {
+            let ids = (vals.iter())
+                .map(|v| values.iter().position(|x| x == v).unwrap_or_else(|| { values.push(v.to_string()); values.len() - 1 }) as u32)
+                .collect();
+            enums.push((name.to_string(), ids));
+            enums.len() - 1
+        });
+        ENUM | i as u32
+    };
+    // Each command's overloads: (parameter name, type, optional). A fixed word is a one-value enum named after it.
+    let mut overloads: Vec<Vec<Vec<(&str, u32, bool)>>> = Vec::new();
+    for c in &commands {
+        let mut list: Vec<Vec<(&str, u32, bool)>> = Vec::new();
+        // The official server's enum values are all lowercase words; a usage with another fixed word (`/team modify
+        // ... displayName`, `/scoreboard ... *`) is left to the raw text overload.
+        let plain = |a: &Arg| !matches!(a, Arg::Literal(w) if !w.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b)));
+        // An empty usage (the bare command) would clash with the optional raw text overload, which covers it: the
+        // official server never sends both.
+        for usage in c.usages.iter().flatten().filter(|u| !u.is_empty() && u.iter().all(plain)) {
+            list.push(usage.iter().map(|a| match a {
+                Arg::Literal(word) => (word.as_str(), enum_type(word, &[word]), false),
+                Arg::Typed { name, parser, greedy } => {
+                    (name.as_str(), bedrock_arg(parser, *greedy).unwrap_or_else(|(e, vals)| enum_type(e, vals)), false)
+                }
+            }).collect());
+        }
+        // A usage that starts another (`gamemode <mode>`, `gamemode <mode> <player>`) becomes that one's optional tail,
+        // as the official server writes it (`gamemode <mode> [player]`); the client drops a list with both.
+        let mut i = 0;
+        while i < list.len() {
+            let short = list[i].clone();
+            let longer = (0..list.len()).filter(|&j| j != i && list[j].len() > short.len()).filter(|&j| {
+                list[j].iter().zip(&short).all(|(a, b)| a.0 == b.0 && a.1 == b.1)
+            }).collect::<Vec<_>>();
+            if longer.is_empty() {
+                i += 1;
+                continue;
+            }
+            // One of them only: two with optional tails would both match the short form.
+            list[longer[0]][short.len()..].iter_mut().for_each(|p| p.2 = true);
+            list.remove(i);
+        }
+        // Raw text only where nothing else is listed (`execute`, aliases): beside a usage it can duplicate (`say
+        // <message>`), and the official server barely uses it.
+        if list.is_empty() {
+            list.push(vec![("args", RAW_TEXT, true)]);
+        }
+        overloads.push(list);
+    }
     let mut w = W::default();
-    w.varuint(0).varuint(0).varuint(0).varuint(0).varuint(0).varuint(names.len() as u32);
-    for name in names {
-        w.string(name).string("").bytes(&0u16.to_le_bytes()).string("any").bytes(&u32::MAX.to_le_bytes()).varuint(0);
-        w.varuint(1).bool(false).varuint(1).string("args").bytes(&RAW_TEXT.to_le_bytes()).bool(true).u8(0);
+    w.varuint(values.len() as u32);
+    for v in &values {
+        w.string(v);
+    }
+    w.varuint(0).varuint(0).varuint(enums.len() as u32);
+    for (name, ids) in &enums {
+        w.string(name).varuint(ids.len() as u32);
+        for id in ids {
+            w.bytes(&id.to_le_bytes());
+        }
+    }
+    w.varuint(0).varuint(commands.len() as u32);
+    for (c, list) in commands.iter().zip(&overloads) {
+        w.string(&c.name).string("").bytes(&0u16.to_le_bytes()).string("any").bytes(&u32::MAX.to_le_bytes()).varuint(0);
+        w.varuint(list.len() as u32);
+        for params in list {
+            w.bool(false).varuint(params.len() as u32);
+            for (name, kind, optional) in params {
+                w.string(name).bytes(&kind.to_le_bytes()).bool(*optional).u8(0);
+            }
+        }
     }
     w.varuint(0).varuint(0);
     w.0
@@ -2054,12 +2151,43 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u32) {
 mod tests {
     use super::*;
 
+    /// Writes the AvailableCommands body built from a live Horizon's command tree to the file HORIZON_DUMP_COMMANDS
+    /// names (joins as `.BridgeTest`).
+    #[tokio::test]
+    #[ignore]
+    async fn dumps_live_command_list() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(crate::java::play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let usages = loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Some(u) = rx.try_iter().find_map(|e| if let crate::java::Event::Commands(u) = e { Some(u) } else { None }) {
+                break u;
+            }
+        };
+        session.abort();
+        std::fs::write(std::env::var_os("HORIZON_DUMP_COMMANDS").unwrap(), available_commands(&usages)).unwrap();
+    }
+
     #[test]
     fn command_list() {
+        use crate::java::commands::{Arg, Usage};
         assert_eq!(available_commands(&[]), [0; 8], "empty: eight empty lists");
-        let p = available_commands(&["tp".into(), "minecraft:tp".into()]); // namespaced names are left out
-        let mut want = vec![0, 0, 0, 0, 0, 1, 2, b't', b'p', 0, 0, 0, 3, b'a', b'n', b'y', 0xFF, 0xFF, 0xFF, 0xFF, 0];
-        want.extend([1, 0, 1, 4, b'a', b'r', b'g', b's', 70, 0, 0x10, 0, 1, 0, 0, 0]);
+        let time = vec![Arg::Literal("set".into()), Arg::Typed { name: "time".into(), parser: "brigadier:integer", greedy: false }];
+        let p = available_commands(&[
+            Usage { name: "time".into(), usages: Some(vec![time]) },
+            Usage { name: "tp".into(), usages: None },
+            Usage { name: "minecraft:tp".into(), usages: None }, // namespaced names are left out
+        ]);
+        let header = |name: &[u8]| [&[name.len() as u8][..], name, &[0, 0, 0, 3], b"any", &[0xFF; 4], &[0]].concat();
+        let args = [&[0, 1, 4][..], b"args", &[70, 0, 0x10, 0, 1, 0]].concat(); // optional raw text
+        let mut want = [&[1, 3][..], b"set", &[0, 0, 1, 3], b"set", &[1, 0, 0, 0, 0, 0, 2]].concat(); // enum "set"
+        want.extend(header(b"time"));
+        want.extend([&[1, 0, 2, 3][..], b"set", &[0, 0, 0x30, 0, 0, 0, 4], b"time", &[1, 0, 0x10, 0, 0, 0]].concat());
+        want.extend(header(b"tp"));
+        want.push(1);
+        want.extend(&args);
+        want.extend([0, 0]);
         assert_eq!(p, want);
     }
 
