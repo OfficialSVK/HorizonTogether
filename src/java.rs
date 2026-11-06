@@ -1879,6 +1879,41 @@ mod tests {
         session.abort();
     }
 
+    /// Hits the nearest mob that appears within 4 blocks at tick 80 (the console summons one and gives a sword first)
+    /// and prints its entity data afterwards.
+    #[tokio::test]
+    #[ignore]
+    async fn hits_a_mob() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = tokio::spawn(play("127.0.0.1:25565".into(), ".BridgeTest".into(), tx, cmd_rx));
+        let mut at = None;
+        while at.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            at = rx.try_iter().find_map(|e| if let Event::Position { x, y, z, .. } = e { Some([x, y, z]) } else { None });
+        }
+        let [x, y, z] = at.unwrap();
+        let mut target = None;
+        for tick in 0..140 {
+            let _ = cmd_tx.send(Command::Move { x, y, z, yaw: -90.0, pitch: 0.0, on_ground: true });
+            if let (80, Some(id)) = (tick, target) {
+                let _ = cmd_tx.send(Command::HeldSlot(0));
+                let _ = cmd_tx.send(Command::Attack(id));
+                println!("tick {tick}: attack {id}");
+            }
+            let _ = cmd_tx.send(Command::TickEnd);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for e in rx.try_iter() {
+                match e {
+                    Event::AddEntity { id, pos, .. } if (pos[0] - x).abs() < 4.0 && (pos[2] - z).abs() < 4.0 => target = Some(id),
+                    Event::EntityData { id, values } if Some(id) == target => println!("tick {tick}: data {values:?}"),
+                    _ => {}
+                }
+            }
+        }
+        session.abort();
+    }
+
     /// Middle-clicks the block under the test player at tick 80 and prints the inventory updates; for a creative
     /// pick of an item not in the hotbar, run `clear .BridgeTest` and `gamemode creative .BridgeTest` first.
     #[tokio::test]

@@ -756,7 +756,11 @@ impl Session {
                 for (index, value) in values {
                     let mut e = W::default();
                     match (index, value) {
-                        (0, Data::Byte(b)) => set(&mut flags, FLAG_SNEAKING, b & 2 != 0),
+                        // Java's shared flags: 0x01 on fire, 0x02 crouching.
+                        (0, Data::Byte(b)) => {
+                            set(&mut flags, FLAG_ON_FIRE, b & 1 != 0);
+                            set(&mut flags, FLAG_SNEAKING, b & 2 != 0);
+                        }
                         (2, Data::Text(name)) if shown != Shown::Player => {
                             e.meta(4, 4).string(&name.unwrap_or_default());
                             entries.insert(4, e.0);
@@ -1414,6 +1418,7 @@ enum Shown {
 /// Actor flags every shown entity starts with: gravity, collision, breathing, climbing (as for players).
 const BASE_FLAGS: i64 = 1 << 19 | 1 << 35 | 1 << 48 | 1 << 49;
 /// Bedrock actor flag bits (gophertunnel's EntityDataFlag order).
+const FLAG_ON_FIRE: i64 = 1;
 const FLAG_SNEAKING: i64 = 1 << 1;
 const FLAG_BABY: i64 = 1 << 11;
 const FLAG_SHOW_NAME: i64 = 1 << 14;
@@ -2388,6 +2393,9 @@ mod tests {
         s.shown.insert(21, Shown::Player);
         let p = s.on_java(Event::EntityData { id: 21, values: vec![(0, crate::java::Data::Byte(2)), (2, crate::java::Data::Text(None))] });
         assert_eq!(s.flags[&21] & FLAG_SNEAKING, FLAG_SNEAKING);
+        assert_eq!(s.flags[&21] & FLAG_ON_FIRE, 0);
+        s.on_java(Event::EntityData { id: 21, values: vec![(0, crate::java::Data::Byte(1))] }); // burning, standing
+        assert_eq!(s.flags[&21] & (FLAG_ON_FIRE | FLAG_SNEAKING), FLAG_ON_FIRE);
         assert_eq!(ids(p), [SET_ACTOR_DATA]);
         // A main-hand swing: Animate, action 1, runtime id 11, data 0.0, no swing source, main hand.
         assert_eq!(s.on_java(Event::Animate { id: 9, action: 0 }), [vec![9, ANIMATE as u8, 1, 11, 0, 0, 0, 0, 0, 0]]);
