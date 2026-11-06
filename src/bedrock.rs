@@ -51,6 +51,7 @@ const BLOCK_PICK_REQUEST: u32 = 34;
 const SYNC_ACTOR_PROPERTY: u32 = 165;
 const BIOME_DEFINITION_LIST: u32 = 122;
 const PLAY_SOUND: u32 = 86;
+const DISCONNECT: u32 = 5;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -171,6 +172,8 @@ pub struct Session {
     variants: std::collections::HashMap<String, Vec<i32>>,
     /// Horizon's top-level commands for this player (Bedrock's command list and autocomplete).
     commands: Vec<crate::java::commands::Usage>,
+    /// Logins must pass the Xbox sign-in check (off with HORIZON_ALLOW_UNVERIFIED=1, and in unit tests).
+    verify_logins: bool,
 }
 
 impl Default for Session {
@@ -215,6 +218,7 @@ impl Default for Session {
             placing: None,
             variants: Default::default(),
             commands: Vec::new(),
+            verify_logins: !cfg!(test) && !allow_unverified(),
         }
     }
 }
@@ -299,13 +303,32 @@ impl Session {
                     self.compressed = true; // from here on, both directions use the prefix byte
                 }
                 LOGIN => {
-                    // shortcut: identity is read but NOT verified yet (milestone 1b step A); LAN use only until then.
                     let who = parse_login(packet)?;
-                    println!(
-                        "Bedrock: Login from {} (XUID {}, protocol {}) - identity NOT verified yet",
-                        who.name, who.xuid, who.protocol
-                    );
-                    self.joined = Some(crate::java::java_name(&who.name));
+                    // The player must be who their Xbox sign-in says (auth.rs): else anyone could join as anyone.
+                    let verified = match &who.proof {
+                        Some((token, data)) => crate::auth::verify(token, data),
+                        None => Err("an old login format without a sign-in token".into()),
+                    };
+                    let name = match verified {
+                        Ok(p) => {
+                            println!("Bedrock: Login from {} (XUID {}, protocol {}), checked against the Xbox sign-in", p.name, p.xuid, who.protocol);
+                            p.name
+                        }
+                        Err(e) if !self.verify_logins => {
+                            println!("Bedrock: Login from {} (XUID {}) NOT checked ({e}); allowed by HORIZON_ALLOW_UNVERIFIED", who.name, who.xuid);
+                            who.name
+                        }
+                        Err(e) => {
+                            eprintln!("Bedrock: refused the login from {:?} (claims XUID {}): {e}", who.name, who.xuid);
+                            // Disconnect: reason 0, show the screen, message and filtered message.
+                            let mut w = W::default();
+                            w.varint(0).bool(false).string("Could not verify your Xbox sign-in. Sign in to Xbox Live and try again.");
+                            w.string("");
+                            out.push(self.batch(&[packet_bytes(DISCONNECT, &w.0)]));
+                            return Ok(out);
+                        }
+                    };
+                    self.joined = Some(crate::java::java_name(&name));
                     // No game-layer encryption: NetherNet already runs over DTLS, and the handshake is server-optional.
                     let mut info = W::default();
                     info.bool(false).bool(false).bool(false).bool(false); // pack required, addons, scripts, no vibrant visuals
@@ -1705,8 +1728,16 @@ fn zigzag(v: u32) -> i32 {
 #[derive(Debug, PartialEq)]
 pub struct LoginInfo {
     pub protocol: i32,
+    /// What the client claims; only trusted once `proof` passes auth::verify.
     pub name: String,
     pub xuid: String,
+    /// The sign-in token and the client data JWT, for auth::verify; none for the old chain format.
+    pub proof: Option<(String, String)>,
+}
+
+/// HORIZON_ALLOW_UNVERIFIED=1 lets players in without checking their Xbox sign-in (LAN tests only).
+pub fn allow_unverified() -> bool {
+    std::env::var_os("HORIZON_ALLOW_UNVERIFIED").is_some_and(|v| v == "1")
 }
 
 /// Login body: `[protocol i32 BE][varint len][[i32 LE len][auth JSON][i32 LE len][client-data JWT]]`.
@@ -1717,6 +1748,7 @@ fn parse_login(mut p: &[u8]) -> Result<LoginInfo, String> {
     let len = read_uvarint(&mut p)? as usize;
     let mut req = take(&mut p, len)?;
     let auth: serde_json::Value = serde_json::from_slice(read_le_bytes(&mut req)?).map_err(|e| format!("auth JSON: {e}"))?;
+    let client_data = read_le_bytes(&mut req).map(|d| String::from_utf8_lossy(d).into_owned()).unwrap_or_default();
     let token = auth["Token"].as_str().filter(|t| !t.is_empty());
     let (name, xuid) = if let Some(token) = token {
         let c = jwt_claims(token)?;
@@ -1736,6 +1768,7 @@ fn parse_login(mut p: &[u8]) -> Result<LoginInfo, String> {
         protocol,
         name: name.ok_or("login has no player name")?,
         xuid: xuid.unwrap_or_default(),
+        proof: token.map(|t| (t.to_string(), client_data)),
     })
 }
 
@@ -2646,8 +2679,11 @@ mod tests {
 
     #[test]
     fn parses_login_identity() {
-        let want = |name: &str, xuid: &str| LoginInfo { protocol: 2225, name: name.into(), xuid: xuid.into() };
-        assert_eq!(parse_login(&login_body(&token_auth("Sergiy", "2533"))).unwrap(), want("Sergiy", "2533"));
+        let want = |name: &str, xuid: &str| LoginInfo { protocol: 2225, name: name.into(), xuid: xuid.into(), proof: None };
+        let login = parse_login(&login_body(&token_auth("Sergiy", "2533"))).unwrap();
+        assert_eq!((login.name.as_str(), login.xuid.as_str()), ("Sergiy", "2533"));
+        let (token, _) = login.proof.expect("the token, for auth::verify");
+        assert_eq!(jwt_claims(&token).unwrap()["xname"], "Sergiy");
 
         let chain = serde_json::json!({"chain": [jwt(serde_json::json!({})), jwt(serde_json::json!({"extraData": {"displayName": "Alex", "XUID": "9"}}))]});
         let legacy = serde_json::json!({"AuthenticationType": 0, "Token": "", "Certificate": chain.to_string()}).to_string();
@@ -2655,5 +2691,18 @@ mod tests {
 
         assert!(parse_login(&login_body(r#"{"Token":""}"#)).is_err());
         assert!(parse_login(&[0, 0, 8]).is_err());
+    }
+
+    #[test]
+    fn refuses_an_unverified_login() {
+        // A forged token (unsigned): with checks on, the client gets a Disconnect and never joins Horizon.
+        let mut s = Session { compressed: true, verify_logins: true, ..Default::default() };
+        let mut batch = Vec::new();
+        let login = packet_bytes(LOGIN, &login_body(&token_auth("Notch", "1")));
+        write_uvarint(&mut batch, login.len() as u32);
+        batch.extend(login);
+        let reply = s.on_message(&[&[0xFF][..], &batch].concat()).unwrap();
+        assert_eq!(ids(&reply), [DISCONNECT]);
+        assert_eq!(s.take_joined(), None);
     }
 }

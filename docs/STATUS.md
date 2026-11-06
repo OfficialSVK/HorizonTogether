@@ -12,7 +12,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | NetherNet signaling | HTTP `POST /v1/join/{id}` takes the client's SDP offer and returns our answer. HTTPS probes are refused immediately so the client falls back to HTTP fast. | `src/nethernet.rs` |
 | WebRTC transport | `str0m` (pure-Rust crypto, no OpenSSL): ICE-lite, DTLS, SCTP data channels. Segmented messages are reassembled, sends are queued with backpressure, and idle connections time out. | `src/webrtc.rs` |
 | Server identity | The answer carries a signed `a=identity` (self-signed ES384, domain `self`, like BDS). Without it the client silently ignores the answer. | `src/identity.rs` |
-| Login | NetworkSettings (zlib in, plain out), Login parsing (gamertag and XUID from the token or the legacy chain), empty resource packs. | `src/bedrock.rs` |
+| Login | NetworkSettings (zlib in, plain out), Login parsing, empty resource packs. Each player is checked against their Xbox sign-in: the login token must be signed by Minecraft's authorization service (RS256, keys fetched from its published key set) and current, and the client data signed by the key it names; the gamertag comes from the checked token. `HORIZON_ALLOW_UNVERIFIED=1` turns the check off for LAN tests. | `src/auth.rs`, `src/bedrock.rs` |
 | Spawn | StartGame, chunks and player state, then a delayed spawn status. The player **walks, flies and breaks blocks**. | `src/bedrock.rs` |
 | Horizon link | Each Bedrock player also joins Horizon as a Java 26.3 player named `.<gamertag>`: offline login, configuration, keep-alives, teleports and chunk acks. Java players see them; they leave Horizon when they leave Bedrock. | `src/java.rs`, `src/webrtc.rs` |
 | Horizon's world on Bedrock | Horizon's chunks are translated to Bedrock sub-chunks (Java block states mapped through Geyser's table), and the player spawns at Horizon's position. Verified: a real Horizon world renders correctly. | `src/world.rs`, `data/java_blocks.bin` |
@@ -29,13 +29,13 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 51 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 53 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
 These are shortcuts that are deliberate for now. The ones inside the code are marked `shortcut:` (search for that).
 
-- **Login identity is not verified.** Anyone who can reach the bridge can join under any name. Keep it on a LAN or VPN until [ROADMAP](ROADMAP.md) item 1 is done.
+- **Horizon must run in offline mode** (the bridge joins as offline-mode players). Players are checked at the bridge, but anyone who can reach Horizon's Java port directly can still join under any name: keep that port private (firewall, or bind it to localhost) until Velocity forwarding is done.
 - **Mob details are partial**: baby mobs, burning, sheep wool and shearing, name tags, sneaking, arm swings and cat, wolf and frog variants, tamed and sitting pets with their collar colours, and taming, love and other mob effects show, and so do warm and cold pigs, cows and chickens (Bedrock's climate_variant property); baby piglins don't, and hitbox sizes are the client's defaults. Other players' real skins aren't shown.
 - **Crafting recipes are Bedrock 1.26.30's** (pmmp/BedrockData): results for items added since then don't show, and results with item data (fireworks, banners) are plain. Stonecutters, smithing tables and anvils don't open yet. Anvils, enchanting tables, brewing stands, looms and other workstations are closed again at once. Items show damage bars and enchantments (Lunge and Sweeping Edge have no Bedrock equivalent), but not custom names, and potions or enchanted books from the creative menu lose their effect on Horizon.
 - **Block entities other than chests and signs** (banners, skulls, beds' colours) have no data yet; sign text colour and glow show as plain black.

@@ -1,5 +1,6 @@
 //! Horizon Bedrock bridge: lets Bedrock Edition clients reach a Horizon (Java 26.3) server.
 //! Usage: horizon-bedrock [horizon_addr=127.0.0.1:25565] [bedrock_bind=0.0.0.0:19132]
+mod auth;
 mod bedrock;
 mod identity;
 mod java;
@@ -40,6 +41,16 @@ async fn main() -> std::io::Result<()> {
 
     str0m::crypto::from_feature_flags().install_process_default();
     HORIZON.set(horizon.clone()).expect("set once");
+    // Players are checked against their Xbox sign-in (auth.rs), with Minecraft's published signing keys.
+    if bedrock::allow_unverified() {
+        println!("HORIZON_ALLOW_UNVERIFIED is set: players are NOT checked against their Xbox sign-in (LAN tests only)");
+    } else {
+        match tokio::task::spawn_blocking(auth::prefetch).await {
+            Ok(Ok(n)) => println!("Xbox sign-in checks on ({n} Minecraft signing keys)"),
+            Ok(Err(e)) => eprintln!("Minecraft signing keys not fetched ({e}); logins will retry, and fail until they can"),
+            Err(e) => eprintln!("signing key fetch failed: {e}"),
+        }
+    }
     let guid = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
     let offline = || java::Status { motd: "Horizon server is offline".into(), online: 0, max: 0 };
     let mut listener = RaknetListener::bind_with_config(
