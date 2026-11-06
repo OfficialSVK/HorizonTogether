@@ -50,6 +50,7 @@ const LEVEL_SOUND_EVENT: u32 = 123;
 const BLOCK_PICK_REQUEST: u32 = 34;
 const SYNC_ACTOR_PROPERTY: u32 = 165;
 const BIOME_DEFINITION_LIST: u32 = 122;
+const PLAY_SOUND: u32 = 86;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -726,6 +727,13 @@ impl Session {
                 packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(entity_id(id)).u8(bedrock).varint(0).bool(false).0));
             }
             crate::java::Event::EntityEvent { .. } => {}
+            // A Java sound as Bedrock's PlaySound (name, position x8, volume, pitch, no loop, range checked, no handle or
+            // start offset).
+            crate::java::Event::Sound { id, pos, volume, pitch } if self.spawned => {
+                let Some(name) = crate::world::bedrock_sound(id) else { return Vec::new() };
+                packets.push(play_sound(name, pos, volume, pitch));
+            }
+            crate::java::Event::Sound { .. } => {}
             crate::java::Event::Death(id) if self.spawned && self.shown.contains_key(&id) => {
                 packets.push(packet_bytes(ACTOR_EVENT, &W::default().varuint64(entity_id(id)).u8(3).varint(0).bool(false).0));
             }
@@ -983,7 +991,17 @@ impl Session {
                 }
             }
             crate::java::Event::Block { pos, state } => {
+                // The player's own door, trapdoor, gate, button or lever (clicked just now), or a plate under their feet
+                // turning on: Java's server leaves that sound to the player's client, so it's played here.
+                let old = self.state_at(pos);
                 self.changed.insert(pos, state);
+                if old.is_some_and(|o| o != state) && self.spawned {
+                    let clicked = self.last_click.is_some_and(|(at, _, t)| at == pos && t.elapsed().as_millis() < 1000);
+                    let feet = self.pos.map(|v| v.floor() as i32) == pos && old.and_then(crate::world::toggle_sound).is_none();
+                    if let Some(name) = crate::world::toggle_sound(state).filter(|_| clicked || feet).and_then(crate::world::bedrock_sound) {
+                        packets.push(play_sound(name, pos.map(|v| v * 8 + 4), 1.0, 1.0));
+                    }
+                }
                 if self.game_mode == 1 && state != 0 && self.breaking == Some(pos) {
                     self.breaking = None; // a block again: creative can break it again
                 }
@@ -1536,6 +1554,15 @@ fn crack(pos: [i32; 3], ticks: Option<u32>) -> Vec<u8> {
     w.varint(if ticks.is_some() { 3600 } else { 3601 }).f32(pos[0] as f32).f32(pos[1] as f32).f32(pos[2] as f32);
     w.varint(ticks.map_or(0, |t| (65535 / t.max(1)) as i32));
     packet_bytes(LEVEL_EVENT, &w.0)
+}
+
+/// PlaySound: a Bedrock sound by name at a position (x8), volume, pitch; no loop, range checked, no handle or start
+/// offset.
+fn play_sound(name: &str, pos: [i32; 3], volume: f32, pitch: f32) -> Vec<u8> {
+    let mut w = W::default();
+    w.string(name).varint(pos[0]).varint(pos[1]).varint(pos[2]).f32(volume).f32(pitch);
+    w.varint(0).bool(false).bool(false).bool(false);
+    packet_bytes(PLAY_SOUND, &w.0)
 }
 
 /// LevelEvent 2001 (particles destroy block): a block's break particles and sound; data is its Bedrock block id.
@@ -2173,6 +2200,21 @@ mod tests {
         };
         session.abort();
         std::fs::write(std::env::var_os("HORIZON_DUMP_COMMANDS").unwrap(), available_commands(&usages)).unwrap();
+    }
+
+    #[test]
+    fn own_lever_clicks() {
+        use crate::java::Event;
+        let (on, off) = (8439, 8440); // a floor lever, Java 26.3 states
+        let mut s = Session { spawned: true, ..Default::default() };
+        let pos = [3, 64, 5];
+        s.changed.insert(pos, off);
+        // Flipped by someone else (no click of ours): Horizon sends them the sound; nothing here.
+        let lever = |p: &[Vec<u8>]| p.iter().any(|b| b.windows(18).any(|w| w == b"random.lever_click"));
+        assert!(!lever(&s.on_java(Event::Block { pos, state: on })));
+        // Flipped by our click: Java's server leaves the sound to us.
+        s.last_click = Some((pos, 1, std::time::Instant::now()));
+        assert!(lever(&s.on_java(Event::Block { pos, state: off })));
     }
 
     #[test]

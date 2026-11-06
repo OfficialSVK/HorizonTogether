@@ -324,6 +324,8 @@ pub enum Event {
     AddItem { id: i32, item: Item, pos: [f64; 3] },
     /// Another entity event (Java's EntityEvent ids: 6 taming failed, 7 tamed, 18 in love...).
     EntityEvent { id: i32, event: u8 },
+    /// A sound at a position: the sound event id, the position x8, volume, pitch.
+    Sound { id: i32, pos: [i32; 3], volume: f32, pitch: f32 },
     /// Someone else broke a block (its particles and sound): position and the state it was.
     BlockBroken { pos: [i32; 3], state: u32 },
     /// An entity was hurt (its red flash); `None` is our own player.
@@ -1646,6 +1648,20 @@ pub async fn play(
                     return Ok(());
                 }
             }
+            // sound: the sound event (registry id + 1; 0 is a sound named inline, not played: shortcut, rare), source,
+            // position x8 (3 i32), volume, pitch, seed.
+            (State::Game, 0x77) => {
+                let holder = read_varint_sync(&mut r)?;
+                if holder > 0 {
+                    read_varint_sync(&mut r)?;
+                    let mut int = || take_bytes(&mut r, 4).map(|b| i32::from_be_bytes(b.try_into().unwrap()));
+                    let pos = [int()?, int()?, int()?];
+                    let (volume, pitch) = (f32::from_bits(int()? as u32), f32::from_bits(int()? as u32));
+                    if events.send(Event::Sound { id: holder - 1, pos, volume, pitch }).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             (State::Game, 0x2d) => c.send(0x1c, &body).await?, // keep alive
             (State::Game, 0x3e) => c.send(0x2d, &body).await?, // ping -> pong
             (State::Game, 0x49) => {
@@ -1808,6 +1824,7 @@ mod tests {
                 match e {
                     Event::OpenContainer { window, menu, size } => println!("opened window {window}: menu {menu}, {size} slots"),
                     Event::ContainerContent { window, slots } => println!("window {window} content: {slots:?}"),
+                    Event::Sound { id, pos, .. } => println!("sound {id} at {pos:?}"),
                     _ => {}
                 }
             }
@@ -2027,6 +2044,7 @@ mod tests {
                 Event::AddPlayer { name, pos, .. } => println!("player {name} at {pos:?}"),
                 Event::MoveEntity { .. } | Event::RemoveEntity { .. } | Event::Block { .. } | Event::BlockBroken { .. } => {}
                 Event::EntityEvent { id, event } => println!("entity {id} event {event}"),
+                Event::Sound { id, pos, .. } => println!("sound {id} at {pos:?}"),
                 Event::Rain(v) => println!("rain {v}"),
                 Event::Thunder(v) => println!("thunder {v}"),
                 Event::Time(t) => println!("time {t}"),
