@@ -93,6 +93,19 @@ def chest_states(blocks):
     return "\n".join(lines) + "\n"
 
 
+def waterlogged_states(blocks):
+    """A bit per Java state id (LSB first): the state holds water, which Bedrock draws as a second block layer.
+    Waterlogged states, plus the blocks that only exist in water."""
+    always = {"minecraft:seagrass", "minecraft:tall_seagrass", "minecraft:kelp", "minecraft:kelp_plant",
+              "minecraft:bubble_column"}
+    ids = [s["id"] for name, b in blocks.items() for s in b["states"]
+           if name in always or s.get("properties", {}).get("waterlogged") == "true"]
+    bits = bytearray((max(s["id"] for b in blocks.values() for s in b["states"]) + 8) // 8)
+    for i in ids:
+        bits[i // 8] |= 1 << (i % 8)
+    return bytes(bits)
+
+
 def main(nbt_path, json_path, out_path):
     _, root = read_nbt(gzip.open(nbt_path).read())
     mappings = [v for _, v in root["bedrock_mappings"][1]]
@@ -101,6 +114,9 @@ def main(nbt_path, json_path, out_path):
     chests = os.path.join(os.path.dirname(out_path), "java_chests.txt")
     open(chests, "w", newline="\n").write(chest_states(blocks))
     print(f"chest states -> {chests}")
+    water = os.path.join(os.path.dirname(out_path), "java_waterlogged.bin")
+    open(water, "wb").write(waterlogged_states(blocks))
+    print(f"waterlogged states -> {water}")
     for name, block in blocks.items():
         for state in block["states"]:
             java_names[state["id"]] = name

@@ -983,13 +983,15 @@ impl Session {
                 if self.game_mode == 1 && state != 0 && self.breaking == Some(pos) {
                     self.breaking = None; // a block again: creative can break it again
                 }
-                // shortcut: layer 0 only; waterlogged Java blocks need water on layer 1 as well.
-                let mut w = W::default();
-                w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(crate::world::java_block(state));
                 // Flags: neighbours, network and priority (as Geyser), which also overrides the client's own guess, such
-                // as a block it placed that Horizon refused (out of Java's reach); layer 0.
-                w.varuint(11).varuint(0);
-                let mut p = vec![packet_bytes(UPDATE_BLOCK, &w.0)];
+                // as a block it placed that Horizon refused (out of Java's reach). Layer 0 is the block, layer 1 the
+                // water a waterlogged block holds (air otherwise, clearing any left from the block before).
+                let update = |block: u32, layer: u32| {
+                    let mut w = W::default();
+                    w.varint(pos[0]).varint(pos[1]).varint(pos[2]).varuint(block).varuint(11).varuint(layer);
+                    packet_bytes(UPDATE_BLOCK, &w.0)
+                };
+                let mut p = vec![update(crate::world::java_block(state), 0), update(crate::world::liquid_layer(state), 1)];
                 // The block the player just placed: Bedrock waits for the server's place sound.
                 if state != 0 && self.placing.take_if(|(at, t)| *at == pos && t.elapsed().as_secs() < 2).is_some() {
                     println!("Bedrock: place sound at {pos:?} (state {state})");

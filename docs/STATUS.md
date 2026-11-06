@@ -29,7 +29,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 49 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 50 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
