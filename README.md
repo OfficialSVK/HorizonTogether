@@ -1,29 +1,88 @@
-# horizon-bedrock
+# HorizonTogether
 
-A Rust bridge that lets **Minecraft Bedrock Edition** players connect to a
-[Horizon](https://playhorizon.dev/) server, which speaks Java Edition 26.3. It's a native,
-Java-free take on what Geyser does.
+A bridge that lets **Minecraft Bedrock Edition** players (Windows, consoles, phones) join a
+[Horizon](https://playhorizon.dev/) server, which speaks Java Edition 26.3. It's a native, Java-free take on what
+Geyser does, written in Rust. The program is called `horizon-bedrock`.
 
-**Status:** Bedrock 26.60 clients join over NetherNet and can walk, fly and break blocks in a test world
-the bridge generates itself. Connecting to Horizon's real world is next, and player identities aren't verified yet,
-so keep the bridge on your own network. See [docs/STATUS.md](docs/STATUS.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status:** Bedrock 26.60 players play on the Horizon world alongside Java players: building, mining, crafting,
+chests and furnaces, mobs, combat, signs, chat and commands (with completion), sounds and the right biome colours.
+Each player is checked against their Xbox sign-in. See [docs/STATUS.md](docs/STATUS.md) for the details and what
+doesn't work yet.
 
-## Run
+## Set up
 
-```sh
-cargo run --release -- [horizon_addr] [bedrock_bind]
-# defaults: 127.0.0.1:25565  0.0.0.0:19132
-```
+You need a Horizon server and this bridge **on the same machine**.
 
-In Bedrock, go to **Play → Servers → Add Server**, enter this machine's address and port, then choose **Play**
-and accept the "trust" prompt. Allow the port through the firewall for **both TCP and UDP**: Bedrock 26.60
-uses HTTP over TCP to find the server and WebRTC over UDP to play.
+1. **Get the bridge.** Download `horizon-bedrock` for Windows or Linux from
+   [Releases](https://github.com/OfficialSVK/HorizonTogether/releases), or build it (below).
+
+2. **Configure Horizon.** The bridge joins Horizon as one Java player per Bedrock player, in offline mode, so
+   Horizon must accept offline logins. Players are checked by the bridge instead, so keep Horizon's own port
+   private: let it listen on this machine only.
+
+   ```sh
+   horizon-server --dir SERVER config set server.online_mode=false server.bind=127.0.0.1
+   horizon-server --dir SERVER restart
+   ```
+
+   With Horizon listening on `127.0.0.1`, Java players on other machines can't connect to it directly. Put a
+   Velocity proxy in front of it for them, or keep Java play to this machine. (Velocity forwarding in the bridge,
+   which would let Horizon stay in online mode, is on the [roadmap](docs/ROADMAP.md).)
+
+3. **Run the bridge.**
+
+   ```sh
+   horizon-bedrock 127.0.0.1:25565 0.0.0.0:19132
+   ```
+
+   The first address is Horizon's, the second is where Bedrock players connect (these are the defaults). It
+   prints `Xbox sign-in checks on` once it has Minecraft's signing keys, which needs internet access.
+
+4. **Let the bridge through the firewall.** Bedrock 26.60 finds the server over HTTP on the Bedrock port (TCP),
+   then plays over WebRTC on a separate UDP port per player, chosen at random. So allow the program rather than
+   one port. On Windows, accept the firewall prompt the first time it runs, or in an Administrator PowerShell:
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "HorizonTogether" -Direction Inbound -Program "C:\path\to\horizon-bedrock.exe" -Action Allow
+   ```
+
+   **Where players can join from:** your local network, or a VPN such as Tailscale (players use the bridge's VPN
+   address). Joining over the internet through router port forwarding doesn't work yet: the random UDP ports can't
+   be forwarded, and the bridge would give outside players its private address. A fixed UDP port and a public
+   address setting are on the [roadmap](docs/ROADMAP.md).
+
+5. **Join from Bedrock.** **Play → Servers → Add Server**, enter the machine's local (or VPN) address and the
+   port, then **Play**, and accept the "trust" prompt the first time.
 
 **Playing Bedrock on the same Windows PC as the bridge?** Use a port other than 19132, then run this once in an
 Administrator PowerShell and restart Minecraft:
 `CheckNetIsolation LoopbackExempt -a -n="Microsoft.MinecraftUWP_8wekyb3d8bbwe"`.
 
-## Contributing
+### Players
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing with a real client, and how to record what
-Mojang's server sends when the client misbehaves.
+A Bedrock player appears on Horizon as `.` plus their gamertag, for example `.Steve`. Use that name for Horizon
+commands such as `op .Steve` or the whitelist.
+
+### Settings
+
+| Environment variable | Effect |
+|---|---|
+| `HORIZON_LANG` | Path to Java's English language file, for full chat messages. By default the bridge finds the one Horizon's launcher extracted. |
+| `HORIZON_ALLOW_UNVERIFIED=1` | Skips the Xbox sign-in check. Only for testing on a private network. |
+
+## Build
+
+With [Rust](https://rustup.rs/) installed:
+
+```sh
+cargo build --release
+# the program is target/release/horizon-bedrock(.exe)
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for testing with a real client and recording what Mojang's server sends.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). Game data generated from GeyserMC's mappings and code ported from Horizon keep their
+own MIT notices ([data/LICENSE-GeyserMC](data/LICENSE-GeyserMC), [data/LICENSE-Horizon](data/LICENSE-Horizon)).
+Minecraft is a trademark of Mojang; this project isn't affiliated with Mojang or Microsoft.

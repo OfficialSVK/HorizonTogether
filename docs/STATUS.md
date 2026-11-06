@@ -41,6 +41,7 @@ These are shortcuts that are deliberate for now. The ones inside the code are ma
 - **Block entities other than chests and signs** (banners, skulls, beds' colours) have no data yet; sign text colour and glow show as plain black.
 - Relative teleports from Horizon are treated as absolute.
 - **One ephemeral UDP port per player.** This works on a LAN. Hosting behind port forwarding needs a fixed port range.
+- **Local network or VPN only.** Each player's WebRTC connection uses a random UDP port and the address the client reached; joining through router port forwarding needs a fixed port and a public address (ROADMAP item 1).
 - **Plain HTTP signaling**, so the client shows a "trust and join" prompt the first time. TLS would remove it.
 - **Joining over RakNet** (clients older than 26.60) is not implemented; only the server-list pong is.
 - **Consoles** (PS5, Xbox, Switch) can't add custom servers. They need an Xbox friends-list broadcast, which hasn't been started.

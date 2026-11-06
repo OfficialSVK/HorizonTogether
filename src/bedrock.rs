@@ -548,9 +548,6 @@ impl Session {
                 BLOCK_PICK_REQUEST if self.linked && self.spawn_status_sent => {
                     let pos = read_block_pos(&mut packet)?;
                     let data = packet.first() == Some(&1);
-                    let eye = self.eye();
-                    let far = (0..3).map(|i| (pos[i] as f32 + 0.5 - eye[i]).powi(2)).sum::<f32>().sqrt();
-                    println!("Bedrock: pick block {pos:?}, {far:.1} blocks from the eyes -> Horizon");
                     self.to_java.push(crate::java::Command::PickBlock { pos, data });
                 }
                 // PlayerAction: runtime id, action, block position, result position, face.
@@ -576,8 +573,6 @@ impl Session {
                                 self.held = slot;
                                 self.to_java.push(crate::java::Command::HeldSlot(slot));
                             }
-                            let item = self.inventory[self.held as usize].map(|i| (i.id, i.count));
-                            println!("Bedrock: {} entity {id} with slot {} ({item:?})", if attack { "attack" } else { "interact with" }, self.held);
                             self.to_java.push(if attack { crate::java::Command::Attack(id) } else { crate::java::Command::Interact(id) });
                         }
                         Ok(Transaction::Drop(n)) => self.drop_held(n),
@@ -883,9 +878,6 @@ impl Session {
             }
             // Only what differs from Bedrock's view is sent: Horizon echoes the slots Bedrock itself just changed.
             crate::java::Event::Inventory { slots } => {
-                if slots.len() < 5 {
-                    println!("Bedrock: Horizon sets slots {:?}", slots.iter().map(|(i, s)| (i, s.map(|s| (s.id, s.count)))).collect::<Vec<_>>());
-                }
                 for (i, item) in slots {
                     if self.inventory[i as usize] != item {
                         self.inventory[i as usize] = item;
@@ -1011,7 +1003,6 @@ impl Session {
                 if self.spawned { packets.extend(out) } else { self.pending.extend(out) }
             }
             crate::java::Event::HeldSlot(slot) => {
-                println!("Bedrock: Horizon selects hotbar slot {slot} ({:?})", self.inventory[slot as usize].map(|i| (i.id, i.count)));
                 self.held = slot;
                 if self.spawned {
                     packets.push(hotbar(slot));
@@ -1043,10 +1034,7 @@ impl Session {
                 let mut p = vec![update(crate::world::java_block(state), 0), update(crate::world::liquid_layer(state), 1)];
                 // The block the player just placed: Bedrock waits for the server's place sound.
                 if state != 0 && self.placing.take_if(|(at, t)| *at == pos && t.elapsed().as_secs() < 2).is_some() {
-                    println!("Bedrock: place sound at {pos:?} (state {state})");
                     p.push(place_sound(pos, state));
-                } else if let Some((at, _)) = self.placing.filter(|(at, _)| (0..3).all(|i| (at[i] - pos[i]).abs() <= 1)) {
-                    println!("Bedrock: block {pos:?} = {state} next to the placing target {at:?}");
                 }
                 // A chest's pairing (a second chest placed beside it changes both): its block entity data.
                 if let Some(nbt) = crate::world::chest_nbt(pos, state) {
@@ -1165,9 +1153,6 @@ impl Session {
                 self.held = slot;
                 self.to_java.push(crate::java::Command::HeldSlot(slot));
             }
-            let eye = self.eye();
-            let far = (0..3).map(|i| (u.pos[i] as f32 + 0.5 - eye[i]).powi(2)).sum::<f32>().sqrt();
-            println!("Bedrock: holding slot {} ({:?}), {far:.1} blocks from the eyes", self.held, self.inventory[self.held as usize].map(|i| (i.id, i.count)));
             self.to_java.push(crate::java::Command::UseOn { pos: u.pos, face, cursor: u.click });
             // Where a placed block would go (faces: down, up, north, south, west, east), for its place sound.
             let [dx, dy, dz] = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]][face as usize];

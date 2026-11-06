@@ -1,0 +1,32 @@
+# Builds horizon-bedrock for Windows and Linux when a version tag (v0.1.0...) is pushed, runs the tests, and attaches
+# the programs to that tag's GitHub release (created if it doesn't exist).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            built: horizon-bedrock.exe
+            asset: horizon-bedrock-windows-x86_64.exe
+          - os: ubuntu-latest
+            built: horizon-bedrock
+            asset: horizon-bedrock-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release
+      - run: cargo build --release
+      - shell: bash
+        run: cp "target/release/${{ matrix.built }}" "${{ matrix.asset }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

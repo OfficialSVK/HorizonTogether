@@ -2,50 +2,36 @@
 
 Ordered by priority. Each item lists where to start. Read [STATUS.md](STATUS.md) for what already works.
 
-## 1. Verify the player's identity (security, do this first)
+Done: checking each player against their Xbox sign-in (`src/auth.rs`), Horizon's world, players, items,
+containers, crafting, mobs, chat and commands, sounds and biomes (see STATUS.md).
 
-Horizon runs in offline mode, so the bridge is the only thing that can stop someone joining under another player's name.
+## 1. Hosting outside a LAN
 
-- The Login's `Token` is an RS256 JWT issued by `https://authorization.franchise.minecraft-services.net/`.
-  Fetch the issuer's OpenID configuration and its JWKS, verify the signature, `exp` and `aud`,
-  then trust only `xname` and `xid`. Cache the keys.
-- Reject logins that only carry a self-signed legacy chain, unless the host opts in.
-- The client's SDP offer also has an `a=identity` signed with the same token's key. Verifying it ties the WebRTC
-  connection to the account.
-- Start in the `LOGIN` handler in `src/bedrock.rs` (its `shortcut:` comment and the "NOT verified" log line), which calls `parse_login`.
-- References: gophertunnel `minecraft/auth`, go-nethernet `identity.go`, CloudburstMC `EncryptionUtils`.
+Today players join from the local network or a VPN only (`src/webrtc.rs`, `src/nethernet.rs`):
 
-## 2. Connect to Horizon (the Java side)
-
-Replace the flat test world with Horizon's real world. Horizon speaks vanilla Java 26.3 (protocol 777) and runs in offline mode.
-
-1. ~~Login, configuration and play as `.gamertag`~~ (done, `src/java.rs`).
-2. ~~Translate Java chunks into Bedrock sub-chunks~~ (done, `src/world.rs`). Still to do: biomes, and block entities.
-3. **Next:** movement from Bedrock to Java (PlayerAuthInput to `move_player_pos_rot` at feet height, moving the chunk
-   publisher along), then other players and entities (PlayerList, AddPlayer), chat, and block break/place.
-4. Consider [`azalea-protocol`](https://github.com/azalea-rs/azalea) for Java packets once it supports 26.3 (it supports 26.2 now).
-
-Geyser (MIT) is the reference translator. Port its logic and credit it.
-
-## 3. Items, inventory, biomes
-
-- Send the full vanilla ItemRegistry and CreativeContent. Geyser ships them for 26.60:
-  `core/src/main/resources/bedrock/runtime_item_states.26_60.json`, `item_components.26_60.nbt`, `creative_items.26_60.json`.
-- Send the full BiomeDefinitionList (Geyser `biome_definitions.dat`). A partial list breaks the join.
-- Send inventory contents (InventoryContent, PlayerHotBar). The official server sends four InventoryContent packets at join.
-
-## 4. Hosting outside a LAN
-
-- A fixed UDP port range for WebRTC (configurable), instead of ephemeral ports.
+- WebRTC uses a new ephemeral UDP port per player and advertises the address the client reached us on. Use one fixed
+  UDP port (the Bedrock port) for every player, demultiplexing by remote address (str0m's `Rtc::accepts`), and an
+  optional public address to advertise as the host candidate, so router port forwarding works.
 - TLS for signaling, to remove the trust prompt.
-- A config file instead of positional arguments (bind address, Horizon address, ports, name prefix).
+- A config file once there are more settings than the two addresses.
 
-## 5. Console players
+## 2. Velocity forwarding
+
+So Horizon can stay in online mode: join as a proxy would, answering Horizon's `velocity:player_info` login plugin
+request with the verified gamertag, a UUID and an HMAC-SHA256 signature over the data with the shared secret (exchange
+in Horizon's `docs/velocity-forwarding.md`). Java players then join through a Velocity proxy.
+
+## 3. Console players
 
 Consoles can't add custom servers. Show the server in the Xbox friends list, as MCXboxBroadcast does.
 Note that MCXboxBroadcast is **GPL-3.0**: reimplement it from the protocol, don't copy its code.
 
-## 6. Keeping up
+## 4. Remaining gaps
+
+See the limitations in STATUS.md: entity sounds and sounds named inline, other players' real skins, mob properties
+other than climate variants, redstone-triggered sounds of the player's own actions, `dappled_forest`.
+
+## 5. Keeping up
 
 Bedrock ships a new protocol about every 6 weeks. Each release needs these updated: the protocol numbers in `src/main.rs`,
 the packet layouts (check [Mojang's protocol docs](https://github.com/Mojang/bedrock-protocol-docs) release for that version),
