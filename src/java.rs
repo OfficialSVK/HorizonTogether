@@ -369,7 +369,7 @@ pub enum Event {
     Enchantments(Vec<String>),
     /// The top-level commands the player may run.
     Commands(Vec<String>),
-    /// A mob variant registry (cat, wolf, frog) in id order.
+    /// A mob variant registry (cat, wolf, frog, pig, cow, chicken) in id order.
     Variants { registry: String, names: Vec<String> },
     /// What another player holds and wears: Java equipment slot (0 main hand, 1 offhand, 2 feet, 3 legs,
     /// 4 chest, 5 head) and item.
@@ -1178,7 +1178,7 @@ pub async fn play(
                     if events.send(Event::Enchantments(enchantments)).is_err() {
                         return Ok(());
                     }
-                } else if [&b"minecraft:cat_variant"[..], b"minecraft:wolf_variant", b"minecraft:frog_variant"].contains(&registry) {
+                } else if [&b"minecraft:cat_variant"[..], b"minecraft:wolf_variant", b"minecraft:frog_variant", b"minecraft:pig_variant", b"minecraft:cow_variant", b"minecraft:chicken_variant"].contains(&registry) {
                     let registry = String::from_utf8_lossy(registry).into_owned();
                     let mut names = Vec::new();
                     for _ in 0..read_varint_sync(&mut r)? {

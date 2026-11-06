@@ -48,6 +48,7 @@ const UPDATE_BLOCK: u32 = 21;
 const LEVEL_EVENT: u32 = 25;
 const LEVEL_SOUND_EVENT: u32 = 123;
 const BLOCK_PICK_REQUEST: u32 = 34;
+const SYNC_ACTOR_PROPERTY: u32 = 165;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -345,6 +346,11 @@ impl Session {
                             packet_bytes(ITEM_REGISTRY, include_bytes!("../data/item_registry.bin")),
                             // Vanilla entity types, including minecraft:player (see data/README.md).
                             packet_bytes(AVAILABLE_ACTOR_IDENTIFIERS, include_bytes!("../data/entity_identifiers.dat")),
+                            // The climate variant properties (warm and cold pigs, cows and chickens), as the official
+                            // server defines them. shortcut: its other mobs' properties (bees, armadillos...) aren't sent.
+                            packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:pig", &["default", "big", "mini"])),
+                            packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:cow", &["default", "moody"])),
+                            packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:chicken", &["default", "picky"])),
                             // PocketMine sends both before spawn: Horizon's commands so far (sent again when they
                             // come), recipes.
                             packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands)),
@@ -734,6 +740,7 @@ impl Session {
                 let mut flags = self.flags.get(&id).copied().unwrap_or(BASE_FLAGS);
                 let set = |flags: &mut i64, bit: i64, on: bool| if on { *flags |= bit } else { *flags &= !bit };
                 let mut entries = std::collections::BTreeMap::new();
+                let mut climate = None; // a pig's, cow's or chicken's: int property 0 (world::climate_properties)
                 for (index, value) in values {
                     let mut e = W::default();
                     match (index, value) {
@@ -782,6 +789,12 @@ impl Session {
                             e.meta(2, 2).varint(self.variant("minecraft:frog_variant", v));
                             entries.insert(2, e.0);
                         }
+                        // Pig (19), cow (18) and chicken (18) variants: Bedrock's climate_variant property.
+                        (19, Data::Id(v)) if kind == "minecraft:pig" => climate = Some(self.variant("minecraft:pig_variant", v)),
+                        (18, Data::Id(v)) if kind == "minecraft:cow" => climate = Some(self.variant("minecraft:cow_variant", v)),
+                        (18, Data::Id(v)) if kind == "minecraft:chicken" => {
+                            climate = Some(self.variant("minecraft:chicken_variant", v))
+                        }
                         _ => {}
                     }
                 }
@@ -794,7 +807,12 @@ impl Session {
                 for e in entries.values() {
                     w.bytes(e);
                 }
-                w.varuint(0).varuint(0).varuint64(0); // no synced properties, tick
+                // Synced properties (int ones: index, value; no float ones), then the tick.
+                match climate {
+                    Some(c) => w.varuint(1).varuint(0).varint(c),
+                    None => w.varuint(0),
+                };
+                w.varuint(0).varuint64(0);
                 let p = packet_bytes(SET_ACTOR_DATA, &w.0);
                 if self.spawned { packets.push(p) } else { self.pending.push(p) }
             }
@@ -1814,6 +1832,8 @@ fn bedrock_variant(registry: &str, java: &str) -> i32 {
         ],
         "minecraft:wolf_variant" => &["pale", "ashen", "black", "chestnut", "rusty", "snowy", "spotted", "striped", "woods"],
         "minecraft:frog_variant" => &["temperate", "cold", "warm"],
+        // The climate_variant property's values (world::climate_properties).
+        "minecraft:pig_variant" | "minecraft:cow_variant" | "minecraft:chicken_variant" => &["temperate", "warm", "cold"],
         _ => &[],
     };
     let name = java.strip_prefix("minecraft:").unwrap_or(java);
@@ -2055,6 +2075,12 @@ mod tests {
         want.varuint64(6).varuint(2).meta(0, 7).varint64(BASE_FLAGS).meta(2, 2).varint(5);
         assert_eq!(p[0][2..2 + want.0.len()], want.0[..]);
         assert_eq!(bedrock_variant("minecraft:wolf_variant", "minecraft:woods"), 8);
+        // A cold pig (Horizon's registry is alphabetical): climate_variant, int property 0, value 2.
+        let names = ["cold", "temperate", "warm"].map(|n| format!("minecraft:{n}")).to_vec();
+        s.on_java(Event::Variants { registry: "minecraft:pig_variant".into(), names });
+        s.shown.insert(5, Shown::Actor("minecraft:pig"));
+        let p = s.on_java(Event::EntityData { id: 5, values: vec![(19, Data::Id(0))] });
+        assert!(p[0].ends_with(&[1, 0, 4, 0, 0]), "properties: one int (index 0, value 2), no floats; tick 0");
     }
 
     #[test]
@@ -2306,6 +2332,9 @@ mod tests {
                 START_GAME,
                 ITEM_REGISTRY,
                 AVAILABLE_ACTOR_IDENTIFIERS,
+                SYNC_ACTOR_PROPERTY,
+                SYNC_ACTOR_PROPERTY,
+                SYNC_ACTOR_PROPERTY,
                 AVAILABLE_COMMANDS,
                 CRAFTING_DATA
             ]

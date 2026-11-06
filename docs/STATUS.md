@@ -29,14 +29,14 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 47 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 48 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
 These are shortcuts that are deliberate for now. The ones inside the code are marked `shortcut:` (search for that).
 
 - **Login identity is not verified.** Anyone who can reach the bridge can join under any name. Keep it on a LAN or VPN until [ROADMAP](ROADMAP.md) item 1 is done.
-- **Mob details are partial**: baby mobs, sheep wool and shearing, name tags, sneaking, arm swings and cat, wolf and frog variants, tamed and sitting pets with their collar colours, and taming, love and other mob effects show; warm and cold pigs, cows and chickens and baby piglins don't, and hitbox sizes are the client's defaults. Other players' real skins aren't shown.
+- **Mob details are partial**: baby mobs, sheep wool and shearing, name tags, sneaking, arm swings and cat, wolf and frog variants, tamed and sitting pets with their collar colours, and taming, love and other mob effects show, and so do warm and cold pigs, cows and chickens (Bedrock's climate_variant property); baby piglins don't, and hitbox sizes are the client's defaults. Other players' real skins aren't shown.
 - **Crafting recipes are Bedrock 1.26.30's** (pmmp/BedrockData): results for items added since then don't show, and results with item data (fireworks, banners) are plain. Stonecutters, smithing tables and anvils don't open yet. Anvils, enchanting tables, brewing stands, looms and other workstations are closed again at once. Items show damage bars and enchantments (Lunge and Sweeping Edge have no Bedrock equivalent), but not custom names, and potions or enchanted books from the creative menu lose their effect on Horizon.
 - **Block entities other than chests and signs** (banners, skulls, beds' colours) have no data yet; sign text colour and glow show as plain black. No biome definitions are sent (the client uses its built-in ones, which Horizon's biomes map onto).
 - Relative teleports from Horizon are treated as absolute.

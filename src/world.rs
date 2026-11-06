@@ -213,6 +213,25 @@ pub fn sign_nbt(pos: [i32; 3], hanging: bool, front: &str, back: &str) -> Vec<u8
     n.end()
 }
 
+/// SyncActorProperty body for a mob with a climate variant (pig, cow, chicken): its properties as the official server
+/// defines them, `minecraft:climate_variant` (index 0: temperate, warm, cold), then `minecraft:sound_variant`.
+pub fn climate_properties(entity: &str, sounds: &[&str]) -> Vec<u8> {
+    let mut n = NbtOut(vec![10, 0]);
+    n.tag(9, "properties").0.push(10); // a list of compounds
+    varint(&mut n.0, 2);
+    for (name, values) in [("minecraft:climate_variant", &["temperate", "warm", "cold"][..]), ("minecraft:sound_variant", sounds)] {
+        n.tag(9, "enum").0.push(8); // a list of strings
+        varint(&mut n.0, values.len() as i32);
+        for v in values {
+            uvarint(&mut n.0, v.len() as u32);
+            n.0.extend(v.as_bytes());
+        }
+        n.string("name", name).int("type", 3).0.push(0); // type 3: enum
+    }
+    n.string("type", entity);
+    n.end()
+}
+
 /// Writer for a Bedrock network NBT compound (little-endian; varint lengths and ints).
 struct NbtOut(Vec<u8>);
 
@@ -473,6 +492,22 @@ fn varint(out: &mut Vec<u8>, v: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn climate_property_definitions() {
+        let pig = climate_properties("minecraft:pig", &["default", "big", "mini"]);
+        assert_eq!(pig[..15], [10, 0, 9, 10, b'p', b'r', b'o', b'p', b'e', b'r', b't', b'i', b'e', b's', 10]);
+        assert!(pig.ends_with(b"\x04type\x0dminecraft:pig\x00"));
+        // Against the official server's own packets (not in this repo, Mojang's EULA): BDS_PROPS names a folder
+        // with pig.hex, cow.hex and chicken.hex, each a recorded SyncActorProperty body.
+        let Some(dir) = std::env::var_os("BDS_PROPS") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        for (name, sounds) in [("pig", &["default", "big", "mini"][..]), ("cow", &["default", "moody"]), ("chicken", &["default", "picky"])] {
+            let hex = std::fs::read_to_string(dir.join(format!("{name}.hex"))).unwrap();
+            let want: Vec<u8> = (0..hex.trim().len()).step_by(2).map(|i| u8::from_str_radix(&hex.trim()[i..i + 2], 16).unwrap()).collect();
+            assert_eq!(climate_properties(&format!("minecraft:{name}"), sounds), want, "{name}");
+        }
+    }
 
     #[test]
     fn fnv_and_hash_shape() {
