@@ -49,6 +49,7 @@ const LEVEL_EVENT: u32 = 25;
 const LEVEL_SOUND_EVENT: u32 = 123;
 const BLOCK_PICK_REQUEST: u32 = 34;
 const SYNC_ACTOR_PROPERTY: u32 = 165;
+const BIOME_DEFINITION_LIST: u32 = 122;
 const ADD_ACTOR: u32 = 13;
 const ADD_ITEM_ACTOR: u32 = 15;
 const TAKE_ITEM_ACTOR: u32 = 17;
@@ -351,6 +352,9 @@ impl Session {
                             packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:pig", &["default", "big", "mini"])),
                             packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:cow", &["default", "moody"])),
                             packet_bytes(SYNC_ACTOR_PROPERTY, &crate::world::climate_properties("minecraft:chicken", &["default", "picky"])),
+                            // Every vanilla biome (tools/gen_biome_data.py): without them the client has no sky, fog
+                            // or water look for the chunks' biomes. Only the full list works (a partial one is refused).
+                            packet_bytes(BIOME_DEFINITION_LIST, include_bytes!("../data/biome_definitions.bin")),
                             // PocketMine sends both before spawn: Horizon's commands so far (sent again when they
                             // come), recipes.
                             packet_bytes(AVAILABLE_COMMANDS, &available_commands(&self.commands)),
@@ -2465,6 +2469,7 @@ mod tests {
                 SYNC_ACTOR_PROPERTY,
                 SYNC_ACTOR_PROPERTY,
                 SYNC_ACTOR_PROPERTY,
+                BIOME_DEFINITION_LIST,
                 AVAILABLE_COMMANDS,
                 CRAFTING_DATA
             ]
