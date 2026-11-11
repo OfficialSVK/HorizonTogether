@@ -23,11 +23,15 @@ pub struct Config {
     pub public_ip: Option<IpAddr>,
     /// The UDP port for gameplay; the Bedrock port + 1 when unset.
     pub rtc_port: Option<u16>,
+    /// Horizon's server folder, for its settings, whitelist and panel (server_admin.rs); empty: those are hidden.
+    pub horizon_dir: String,
+    /// The `horizon-server` program; empty: the newest from Horizon's launcher, else the PATH's.
+    pub horizon_exe: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { horizon: "127.0.0.1:25565".into(), bedrock_port: 19132, public_ip: None, rtc_port: None }
+        Config { horizon: "127.0.0.1:25565".into(), bedrock_port: 19132, public_ip: None, rtc_port: None, horizon_dir: String::new(), horizon_exe: String::new() }
     }
 }
 
@@ -38,6 +42,8 @@ impl Config {
             "bedrock_port": self.bedrock_port,
             "public_ip": self.public_ip.map(|ip| ip.to_string()).unwrap_or_default(),
             "rtc_port": self.rtc_port,
+            "horizon_dir": self.horizon_dir,
+            "horizon_exe": self.horizon_exe,
         })
     }
 
@@ -61,7 +67,15 @@ impl Config {
             None | Some("") => None,
             Some(ip) => Some(ip.parse().map_err(|_| format!("Public address: {ip:?} isn't an IP address"))?),
         };
-        Ok(Config { horizon, bedrock_port: port("bedrock_port")?.unwrap_or(19132), public_ip, rtc_port: port("rtc_port")? })
+        let text = |k: &str| v[k].as_str().unwrap_or("").trim().to_string();
+        Ok(Config {
+            horizon,
+            bedrock_port: port("bedrock_port")?.unwrap_or(19132),
+            public_ip,
+            rtc_port: port("rtc_port")?,
+            horizon_dir: text("horizon_dir"),
+            horizon_exe: text("horizon_exe"),
+        })
     }
 }
 
@@ -199,7 +213,10 @@ async fn handle(mut sock: tokio::net::TcpStream) -> std::io::Result<()> {
     }
     let line = head.lines().next().unwrap_or("");
     let (method, target) = line.split_once(' ').map(|(m, rest)| (m, rest.split(' ').next().unwrap_or(""))).unwrap_or(("", ""));
-    let (code, kind, body, after) = respond(method, target, header("host").as_deref(), header("x-token").as_deref(), &buf[head_end..n]);
+    let (method, target, host, token, body) = (method.to_string(), target.to_string(), header("host"), header("x-token"), buf[head_end..n].to_vec());
+    // Some routes run horizon-server (a restart takes seconds): off the async threads.
+    let (code, kind, body, after) =
+        tokio::task::spawn_blocking(move || respond(&method, &target, host.as_deref(), token.as_deref(), &body)).await.map_err(std::io::Error::other)?;
     let reply = format!("HTTP/1.1 {code}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
     sock.write_all(reply.as_bytes()).await?;
     sock.write_all(body.as_bytes()).await?;
@@ -231,6 +248,7 @@ fn respond(method: &str, target: &str, host: Option<&str>, token: Option<&str>, 
     if !local {
         return ("403 Forbidden", "text/plain", "This page only answers on 127.0.0.1.".into(), After::Nothing);
     }
+    let admin = with(|s| crate::server_admin::Admin::new(&s.config.horizon_dir, Some(&s.config.horizon_exe))).flatten();
     let (page_token, status) = with(|s| {
         let status = json!({
             "config": s.config.to_json(),
@@ -244,6 +262,7 @@ fn respond(method: &str, target: &str, host: Option<&str>, token: Option<&str>, 
     .unwrap_or_default();
     let allowed = token.is_some_and(|t| !page_token.is_empty() && t == page_token);
     let json = |v: Value| ("200 OK", "application/json", v.to_string(), After::Nothing);
+    let fail = |e: String| ("400 Bad Request", "application/json", json!({"error": e}).to_string(), After::Nothing);
     match (method, target) {
         ("GET", "/") => ("200 OK", "text/html; charset=utf-8", PAGE.replace("{{TOKEN}}", &page_token), After::Nothing),
         ("GET", "/status") => json(status),
@@ -263,6 +282,34 @@ fn respond(method: &str, target: &str, host: Option<&str>, token: Option<&str>, 
             Err(e) => ("502 Bad Gateway", "application/json", json!({"error": e}).to_string(), After::Nothing),
         },
         ("POST", "/quit") => ("200 OK", "application/json", json!({"ok": true}).to_string(), After::Quit),
+        // The Horizon server's settings and whitelist (server_admin.rs), when its folder is set.
+        ("GET", "/server") => json(match &admin {
+            None => json!({"configured": false}),
+            Some(a) => json!({
+                "configured": true,
+                "where": a.describe(),
+                "settings": a.settings().map_err(|e| json!({"error": e})).unwrap_or_else(|e| e),
+                "whitelist": a.whitelist().map(|w| json!(w)).unwrap_or_else(|e| json!({"error": e})),
+            }),
+        }),
+        ("POST", path) if path.starts_with("/server/") => {
+            let Some(a) = &admin else { return fail("Set the Horizon server folder in Settings first.".into()) };
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let done = match path {
+                "/server/settings" => a.apply(&v).inspect(|_| event("Horizon settings saved; Horizon restarted")),
+                "/server/whitelist" => {
+                    let add = v["action"] == "add";
+                    let name = v["name"].as_str().unwrap_or("");
+                    a.whitelist_change(add, name).inspect(|_| event(format!("Whitelist: {} {name}", if add { "added" } else { "removed" })))
+                }
+                "/server/panel" => a.panel_link().inspect(|link| open(link)),
+                _ => Err("unknown action".into()),
+            };
+            match done {
+                Ok(out) => json(json!({"ok": true, "output": out})),
+                Err(e) => fail(e),
+            }
+        }
         _ => ("404 Not Found", "text/plain", String::new(), After::Nothing),
     }
 }
@@ -305,7 +352,7 @@ mod tests {
     #[test]
     fn checks_settings() {
         let ok = Config::from_json(&json!({"horizon": "127.0.0.1:25565", "bedrock_port": "19140", "public_ip": "81.109.216.16", "rtc_port": ""})).unwrap();
-        assert_eq!(ok, Config { horizon: "127.0.0.1:25565".into(), bedrock_port: 19140, public_ip: Some("81.109.216.16".parse().unwrap()), rtc_port: None });
+        assert_eq!(ok, Config { horizon: "127.0.0.1:25565".into(), bedrock_port: 19140, public_ip: Some("81.109.216.16".parse().unwrap()), rtc_port: None, ..Config::default() });
         assert_eq!(Config::from_json(&ok.to_json()).unwrap(), ok, "round trip");
         assert!(Config::from_json(&json!({"horizon": "localhost"})).unwrap_err().starts_with("Horizon server"));
         assert!(Config::from_json(&json!({"horizon": "a:1", "bedrock_port": 70000})).unwrap_err().starts_with("bedrock_port"));

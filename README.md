@@ -43,6 +43,18 @@ You need a Horizon server and this bridge **on the same machine**.
    recent joins and refused logins. **Stop the bridge** shuts it down. The console window that opens with it
    shows the full log; keep it open while the bridge runs.
 
+   **Managing Horizon from the panel:** set the **Horizon server folder** (the folder you run
+   `horizon-server --dir` on) and the panel gets a **Horizon server** section:
+
+   - **World settings:** message in the server list, difficulty, new players' game mode, max players, view
+     distance, and whitelist on or off. **Save & restart Horizon** applies them (everyone online is disconnected
+     for a moment).
+   - **Whitelist:** add and remove players; changes apply at once. Bedrock players are `.gamertag`.
+   - **Open Horizon's panel:** Horizon's own web panel (console, players, backups, performance), with a one-time
+     login link.
+
+   It runs Horizon's `horizon-server` program on that folder, finding it from Horizon's launcher.
+
 4. **Open two ports.** Bedrock 26.60 finds the server over HTTP on the Bedrock port (**TCP**), then plays over
    WebRTC on the next port up (**UDP**): 19132 and 19133 by default (the panel's **Gameplay port** changes the
    second). On Windows, accept the firewall prompt the first time the bridge runs, or in an Administrator

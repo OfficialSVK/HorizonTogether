@@ -20,6 +20,13 @@
   .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
   label { display: block; font-weight: 600; margin: 12px 0 4px; }
   .hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+  .row > div { flex: 1; }
+  label.check { display: flex; gap: 8px; align-items: center; font-weight: 600; margin-top: 14px; }
+  label.check input { width: auto; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  #wl { list-style: none; padding: 0; } #wl li { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  select, input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
   input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
   input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .row { display: flex; gap: 8px; } .row input { flex: 1; }
@@ -68,12 +75,58 @@
       <input id="rtc-in" name="rtc_port" inputmode="numeric" placeholder="Bedrock port + 1">
       <p class="hint">The UDP port for gameplay. Forward it on your router too, with the same number inside and out.</p>
 
+      <label for="dir-in">Horizon server folder (optional)</label>
+      <input id="dir-in" name="horizon_dir" placeholder="For example C:\Users\you\my-horizon-server">
+      <p class="hint">The folder you run <code>horizon-server --dir</code> on. Set it to manage Horizon's world settings and whitelist below.</p>
+      <input type="hidden" id="exe-in" name="horizon_exe">
+
       <div class="actions">
         <button type="submit" class="primary">Save &amp; restart</button>
         <button type="button" id="quit">Stop the bridge</button>
         <p id="msg" role="status" aria-live="polite"></p>
       </div>
     </form>
+  </section>
+
+  <section class="card" aria-labelledby="server-h">
+    <h2 id="server-h">Horizon server</h2>
+    <p id="server-none" class="muted">Set the Horizon server folder in Settings to manage its world settings and whitelist here.</p>
+    <div id="server" hidden>
+      <form id="world">
+        <label for="motd-in">Message in the server list</label>
+        <input id="motd-in" name="server.motd" maxlength="100">
+        <div class="row">
+          <div><label for="diff-in">Difficulty</label>
+            <select id="diff-in" name="world.difficulty"><option>peaceful</option><option>easy</option><option>normal</option><option>hard</option></select></div>
+          <div><label for="mode-in">New players' game mode</label>
+            <select id="mode-in" name="world.game_mode"><option>survival</option><option>creative</option><option>adventure</option><option>spectator</option></select></div>
+        </div>
+        <div class="row">
+          <div><label for="max-in">Max players</label><input id="max-in" name="server.max_players" inputmode="numeric"></div>
+          <div><label for="view-in">View distance (chunks)</label><input id="view-in" name="server.view_distance" inputmode="numeric"></div>
+        </div>
+        <label class="check"><input type="checkbox" id="wl-on" name="server.whitelist"> Only whitelisted players can join</label>
+        <div class="actions">
+          <button type="submit" class="primary">Save &amp; restart Horizon</button>
+          <p id="world-msg" role="status" aria-live="polite"></p>
+        </div>
+      </form>
+
+      <h2 style="margin-top:20px">Whitelist</h2>
+      <p class="hint">Bedrock players are a dot plus their gamertag, for example <code>.Steve</code>. Changes apply at once.</p>
+      <ul id="wl"></ul>
+      <form id="wl-add" class="row" style="margin-top:8px">
+        <label for="wl-name" class="sr">Player name</label>
+        <input id="wl-name" placeholder=".Gamertag or Java name" required maxlength="17">
+        <button type="submit">Add</button>
+      </form>
+      <p id="wl-msg" role="status" aria-live="polite"></p>
+
+      <div class="actions">
+        <button type="button" id="hpanel">Open Horizon's panel</button>
+        <span class="hint">Console, players, backups and performance, in Horizon's own panel (a one-time login link).</span>
+      </div>
+    </div>
   </section>
 
   <section class="card" aria-labelledby="events-h">
@@ -114,7 +167,9 @@ async function refresh() {
     if (!filled) {
       $("horizon-in").value = s.config.horizon; $("port-in").value = s.config.bedrock_port;
       $("ip-in").value = s.config.public_ip; $("rtc-in").value = s.config.rtc_port ?? "";
+      $("dir-in").value = s.config.horizon_dir; $("exe-in").value = s.config.horizon_exe;
       filled = true;
+      loadServer();
     }
   } catch {
     const state = $("state");
@@ -141,6 +196,53 @@ $("quit").addEventListener("click", async () => {
   if (!confirm("Stop the bridge? Bedrock players will be disconnected.")) return;
   try { await post("/quit"); } catch {}
   say("The bridge has stopped. Start horizon-bedrock again to bring it back.", "muted");
+});
+
+// The Horizon server section: its settings and whitelist, read with horizon-server (not polled: it runs a program).
+async function loadServer() {
+  let s;
+  try { s = await (await fetch("/server", { cache: "no-store" })).json(); } catch { return; }
+  $("server").hidden = !s.configured; $("server-none").hidden = s.configured;
+  if (!s.configured) return;
+  if (s.settings.error) { $("world-msg").textContent = "Couldn't read Horizon's settings: " + s.settings.error; $("world-msg").className = "bad"; }
+  else {
+    const set = s.settings;
+    $("motd-in").value = set["server.motd"] ?? ""; $("diff-in").value = set["world.difficulty"] ?? "easy";
+    $("mode-in").value = set["world.game_mode"] ?? "survival"; $("max-in").value = set["server.max_players"] ?? "";
+    $("view-in").value = set["server.view_distance"] ?? ""; $("wl-on").checked = set["server.whitelist"] === "true";
+  }
+  const wl = $("wl"); wl.innerHTML = "";
+  const names = Array.isArray(s.whitelist) ? s.whitelist : [];
+  if (!Array.isArray(s.whitelist)) { const li = document.createElement("li"); li.textContent = "Couldn't read the whitelist: " + s.whitelist.error; wl.append(li); }
+  else if (!names.length) { const li = document.createElement("li"); li.className = "muted"; li.textContent = "Nobody yet."; wl.append(li); }
+  for (const n of names) {
+    const li = document.createElement("li"); const span = document.createElement("span"); span.textContent = n;
+    const b = document.createElement("button"); b.type = "button"; b.textContent = "Remove"; b.setAttribute("aria-label", "Remove " + n);
+    b.onclick = () => whitelist("remove", n);
+    li.append(span, b); wl.append(li);
+  }
+}
+
+async function whitelist(action, name) {
+  const m = $("wl-msg");
+  try { await post("/server/whitelist", { action, name }); m.textContent = (action === "add" ? "Added " : "Removed ") + name; m.className = "ok"; loadServer(); }
+  catch (err) { m.textContent = err.message; m.className = "bad"; }
+}
+
+$("wl-add").addEventListener("submit", (e) => { e.preventDefault(); whitelist("add", $("wl-name").value.trim()); $("wl-name").value = ""; });
+
+$("world").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!confirm("Save and restart Horizon? Everyone online is disconnected for a moment.")) return;
+  const f = Object.fromEntries(new FormData(e.target).entries());
+  f["server.whitelist"] = $("wl-on").checked;
+  const m = $("world-msg"); m.textContent = "Saving and restarting Horizon…"; m.className = "muted";
+  try { await post("/server/settings", f); m.textContent = "Saved. Horizon has restarted."; m.className = "ok"; loadServer(); }
+  catch (err) { m.textContent = err.message; m.className = "bad"; }
+});
+
+$("hpanel").addEventListener("click", async () => {
+  try { await post("/server/panel"); } catch (err) { alert("Couldn't open Horizon's panel: " + err.message); }
 });
 
 refresh();

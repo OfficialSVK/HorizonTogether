@@ -7,6 +7,7 @@ mod identity;
 mod java;
 mod nethernet;
 mod panel;
+mod server_admin;
 mod webrtc;
 mod world;
 
@@ -74,7 +75,7 @@ async fn main() -> std::io::Result<()> {
         Err(_) => saved.public_ip,
     };
     if with_panel {
-        let shown = panel::Config { horizon: horizon.clone(), bedrock_port: bind.port(), public_ip, rtc_port: saved.rtc_port };
+        let shown = panel::Config { horizon: horizon.clone(), bedrock_port: bind.port(), public_ip, rtc_port: saved.rtc_port, ..saved.clone() };
         let checks = !bedrock::allow_unverified();
         tokio::spawn(async move {
             if let Err(e) = panel::serve(shown, checks, std::env::var_os("HORIZON_RESTARTED").is_none()).await {
