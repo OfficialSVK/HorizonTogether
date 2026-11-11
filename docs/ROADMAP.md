@@ -5,14 +5,12 @@ Ordered by priority. Each item lists where to start. Read [STATUS.md](STATUS.md)
 Done: checking each player against their Xbox sign-in (`src/auth.rs`), Horizon's world, players, items,
 containers, crafting, mobs, chat and commands, sounds and biomes (see STATUS.md).
 
-## 1. Hosting outside a LAN
+## 1. Hosting polish
 
-Today players join from the local network or a VPN only (`src/webrtc.rs`, `src/nethernet.rs`):
+Internet hosting works (one fixed UDP port, `HORIZON_PUBLIC_IP`). Still to do:
 
-- WebRTC uses a new ephemeral UDP port per player and advertises the address the client reached us on. Use one fixed
-  UDP port (the Bedrock port) for every player, demultiplexing by remote address (str0m's `Rtc::accepts`), and an
-  optional public address to advertise as the host candidate, so router port forwarding works.
 - TLS for signaling, to remove the trust prompt.
+- Finding the public address automatically (STUN), instead of `HORIZON_PUBLIC_IP`.
 - A config file once there are more settings than the two addresses.
 
 ## 2. Velocity forwarding

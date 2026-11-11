@@ -10,7 +10,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 |---|---|---|
 | Server list | The Bedrock client shows the bridge's name and live player count, taken from Horizon's Java status ping. Both NetherNet (`GET /v1/join`) and RakNet pong are answered. | `src/main.rs`, `src/java.rs`, `src/nethernet.rs` |
 | NetherNet signaling | HTTP `POST /v1/join/{id}` takes the client's SDP offer and returns our answer. HTTPS probes are refused immediately so the client falls back to HTTP fast. | `src/nethernet.rs` |
-| WebRTC transport | `str0m` (pure-Rust crypto, no OpenSSL): ICE-lite, DTLS, SCTP data channels. Segmented messages are reassembled, sends are queued with backpressure, and idle connections time out. | `src/webrtc.rs` |
+| WebRTC transport | `str0m` (pure-Rust crypto, no OpenSSL): ICE-lite, DTLS, SCTP data channels. Every player shares one UDP port (the Bedrock port + 1, `HORIZON_RTC_PORT`), routed by ICE username, and `HORIZON_PUBLIC_IP` is offered to players outside the local network: verified joining from mobile data through router port forwarding. Segmented messages are reassembled, sends are queued with backpressure, and idle connections time out. | `src/webrtc.rs` |
 | Server identity | The answer carries a signed `a=identity` (self-signed ES384, domain `self`, like BDS). Without it the client silently ignores the answer. | `src/identity.rs` |
 | Login | NetworkSettings (zlib in, plain out), Login parsing, empty resource packs. Each player is checked against their Xbox sign-in: the login token must be signed by Minecraft's authorization service (RS256, keys fetched from its published key set) and current, and the client data signed by the key it names; the gamertag comes from the checked token. `HORIZON_ALLOW_UNVERIFIED=1` turns the check off for LAN tests. | `src/auth.rs`, `src/bedrock.rs` |
 | Spawn | StartGame, chunks and player state, then a delayed spawn status. The player **walks, flies and breaks blocks**. | `src/bedrock.rs` |
@@ -29,7 +29,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 53 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 54 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
@@ -41,7 +41,6 @@ These are shortcuts that are deliberate for now. The ones inside the code are ma
 - **Block entities other than chests and signs** (banners, skulls, beds' colours) have no data yet; sign text colour and glow show as plain black.
 - Relative teleports from Horizon are treated as absolute.
 - **One ephemeral UDP port per player.** This works on a LAN. Hosting behind port forwarding needs a fixed port range.
-- **Local network or VPN only.** Each player's WebRTC connection uses a random UDP port and the address the client reached; joining through router port forwarding needs a fixed port and a public address (ROADMAP item 1).
 - **Plain HTTP signaling**, so the client shows a "trust and join" prompt the first time. TLS would remove it.
 - **Joining over RakNet** (clients older than 26.60) is not implemented; only the server-list pong is.
 - **Consoles** (PS5, Xbox, Switch) can't add custom servers. They need an Xbox friends-list broadcast, which hasn't been started.

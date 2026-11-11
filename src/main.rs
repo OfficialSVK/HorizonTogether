@@ -59,6 +59,18 @@ async fn main() -> std::io::Result<()> {
     )
     .await?;
     let (tx, mut rx) = watch::channel(offline());
+    // NetherNet's WebRTC traffic: one fixed UDP port for every player (RakNet holds the Bedrock port's UDP side), and
+    // the public address to offer players outside the local network.
+    let rtc_port = std::env::var("HORIZON_RTC_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(bind.port().wrapping_add(1));
+    let public_ip: Option<std::net::IpAddr> = match std::env::var("HORIZON_PUBLIC_IP") {
+        Ok(ip) => Some(ip.trim().parse().expect("HORIZON_PUBLIC_IP must be an IP address")),
+        Err(_) => None,
+    };
+    webrtc::start(std::net::SocketAddr::new(bind.ip(), rtc_port), public_ip)?;
+    match public_ip {
+        Some(ip) => println!("WebRTC on udp port {rtc_port}; players outside this network are offered {ip}:{rtc_port}"),
+        None => println!("WebRTC on udp port {rtc_port} (set HORIZON_PUBLIC_IP for players outside this network)"),
+    }
     // Bedrock 26.60+ uses NetherNet (HTTP signaling on TCP, same port number); older clients use RakNet.
     tokio::spawn(nethernet::serve(tokio::net::TcpListener::bind(bind).await?, rx.clone()));
     println!("Bedrock listening on udp+tcp {bind}, forwarding to Horizon at {horizon}");

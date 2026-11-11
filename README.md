@@ -38,21 +38,29 @@ You need a Horizon server and this bridge **on the same machine**.
    The first address is Horizon's, the second is where Bedrock players connect (these are the defaults). It
    prints `Xbox sign-in checks on` once it has Minecraft's signing keys, which needs internet access.
 
-4. **Let the bridge through the firewall.** Bedrock 26.60 finds the server over HTTP on the Bedrock port (TCP),
-   then plays over WebRTC on a separate UDP port per player, chosen at random. So allow the program rather than
-   one port. On Windows, accept the firewall prompt the first time it runs, or in an Administrator PowerShell:
+4. **Open two ports.** Bedrock 26.60 finds the server over HTTP on the Bedrock port (**TCP**), then plays over
+   WebRTC on the next port up (**UDP**): 19132 and 19133 by default. On Windows, accept the firewall prompt the
+   first time the bridge runs, or in an Administrator PowerShell:
 
    ```powershell
    New-NetFirewallRule -DisplayName "HorizonTogether" -Direction Inbound -Program "C:\path\to\horizon-bedrock.exe" -Action Allow
    ```
 
-   **Where players can join from:** your local network, or a VPN such as Tailscale (players use the bridge's VPN
-   address). Joining over the internet through router port forwarding doesn't work yet: the random UDP ports can't
-   be forwarded, and the bridge would give outside players its private address. A fixed UDP port and a public
-   address setting are on the [roadmap](docs/ROADMAP.md).
+   **For players outside your home network**, forward both ports on your router to this machine (TCP 19132 and
+   UDP 19133, same numbers inside and out), and tell the bridge your public address:
 
-5. **Join from Bedrock.** **Play → Servers → Add Server**, enter the machine's local (or VPN) address and the
-   port, then **Play**, and accept the "trust" prompt the first time.
+   ```sh
+   HORIZON_PUBLIC_IP=203.0.113.7 horizon-bedrock 127.0.0.1:25565 0.0.0.0:19132     # Linux / macOS
+   $env:HORIZON_PUBLIC_IP="203.0.113.7"; .\horizon-bedrock.exe 127.0.0.1:25565 0.0.0.0:19132   # Windows PowerShell
+   ```
+
+   Players at home join with the machine's local address, everyone else with the public one. If your router
+   shows a WAN address starting `10.` or `100.`, your provider uses carrier-grade NAT and forwarding can't work:
+   use a VPN such as Tailscale instead. A router usually can't loop its own public address back in, so test from
+   outside (a phone on mobile data).
+
+5. **Join from Bedrock.** **Play → Servers → Add Server**, enter the address and the Bedrock port, then
+   **Play**, and accept the "trust" prompt the first time.
 
 **Playing Bedrock on the same Windows PC as the bridge?** Use a port other than 19132, then run this once in an
 Administrator PowerShell and restart Minecraft:
@@ -68,6 +76,8 @@ commands such as `op .Steve` or the whitelist.
 | Environment variable | Effect |
 |---|---|
 | `HORIZON_LANG` | Path to Java's English language file, for full chat messages. By default the bridge finds the one Horizon's launcher extracted. |
+| `HORIZON_PUBLIC_IP` | Your public address, offered to players outside your network (see step 4). |
+| `HORIZON_RTC_PORT` | The UDP port for gameplay, if not the Bedrock port + 1. |
 | `HORIZON_ALLOW_UNVERIFIED=1` | Skips the Xbox sign-in check. Only for testing on a private network. |
 
 ## Build
