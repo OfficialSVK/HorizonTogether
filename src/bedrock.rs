@@ -312,6 +312,7 @@ impl Session {
                     let name = match verified {
                         Ok(p) => {
                             println!("Bedrock: Login from {} (XUID {}, protocol {}), checked against the Xbox sign-in", p.name, p.xuid, who.protocol);
+                            crate::panel::event(format!("{} joined (Xbox sign-in checked)", p.name));
                             p.name
                         }
                         Err(e) if !self.verify_logins => {
@@ -320,6 +321,7 @@ impl Session {
                         }
                         Err(e) => {
                             eprintln!("Bedrock: refused the login from {:?} (claims XUID {}): {e}", who.name, who.xuid);
+                            crate::panel::event(format!("Refused {} (Xbox sign-in not verified: {e})", who.name));
                             // Disconnect: reason 0, show the screen, message and filtered message.
                             let mut w = W::default();
                             w.varint(0).bool(false).string("Could not verify your Xbox sign-in. Sign in to Xbox Live and try again.");

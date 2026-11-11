@@ -171,6 +171,7 @@ impl Drop for AbortOnDrop {
 
 fn run(mut rtc: Rtc, link: Link, rt: tokio::runtime::Handle) -> Result<(), RtcError> {
     let mut _java: Option<AbortOnDrop> = None;
+    let mut _connected: Option<crate::panel::PlayerGuard> = None; // listed on the control panel until this ends
     let mut java_events: Option<std::sync::mpsc::Receiver<crate::java::Event>> = None;
     let mut java_commands: Option<tokio::sync::mpsc::UnboundedSender<crate::java::Command>> = None;
     let mut reliable = None;
@@ -181,6 +182,7 @@ fn run(mut rtc: Rtc, link: Link, rt: tokio::runtime::Handle) -> Result<(), RtcEr
     let mut last_rx = Instant::now();
     loop {
         if let Some(name) = session.take_joined() {
+            _connected = Some(crate::panel::player(&name));
             let addr = crate::HORIZON.get().cloned().unwrap_or_default();
             let (tx, rx) = std::sync::mpsc::channel();
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();

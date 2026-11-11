@@ -1,10 +1,12 @@
 //! Horizon Bedrock bridge: lets Bedrock Edition clients reach a Horizon (Java 26.3) server.
 //! Usage: horizon-bedrock [horizon_addr=127.0.0.1:25565] [bedrock_bind=0.0.0.0:19132]
+//! Started without arguments, it uses the saved settings (horizontogether.json) and opens the control panel.
 mod auth;
 mod bedrock;
 mod identity;
 mod java;
 mod nethernet;
+mod panel;
 mod webrtc;
 mod world;
 
@@ -31,13 +33,16 @@ fn pong(guid: u64, port: u16, s: &java::Status) -> Vec<u8> {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let horizon = args.next().unwrap_or_else(|| "127.0.0.1:25565".into());
-    let bind: std::net::SocketAddr = args
-        .next()
-        .unwrap_or_else(|| "0.0.0.0:19132".into())
-        .parse()
-        .expect("bedrock_bind must be ip:port");
+    // Arguments, then environment variables, then the saved settings (the control panel's), then the defaults.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let saved = panel::load();
+    let horizon = args.first().cloned().unwrap_or_else(|| saved.horizon.clone());
+    let bind: std::net::SocketAddr = match args.get(1) {
+        Some(b) => b.parse().expect("bedrock_bind must be ip:port"),
+        None => panel::bind(&saved),
+    };
+    let with_panel = args.is_empty() && std::env::var_os("HORIZON_NO_PANEL").is_none();
+    panel::wait_after_restart();
 
     str0m::crypto::from_feature_flags().install_process_default();
     HORIZON.set(horizon.clone()).expect("set once");
@@ -61,11 +66,22 @@ async fn main() -> std::io::Result<()> {
     let (tx, mut rx) = watch::channel(offline());
     // NetherNet's WebRTC traffic: one fixed UDP port for every player (RakNet holds the Bedrock port's UDP side), and
     // the public address to offer players outside the local network.
-    let rtc_port = std::env::var("HORIZON_RTC_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(bind.port().wrapping_add(1));
+    let rtc_port = (std::env::var("HORIZON_RTC_PORT").ok().and_then(|p| p.parse().ok()))
+        .or(saved.rtc_port)
+        .unwrap_or(bind.port().wrapping_add(1));
     let public_ip: Option<std::net::IpAddr> = match std::env::var("HORIZON_PUBLIC_IP") {
         Ok(ip) => Some(ip.trim().parse().expect("HORIZON_PUBLIC_IP must be an IP address")),
-        Err(_) => None,
+        Err(_) => saved.public_ip,
     };
+    if with_panel {
+        let shown = panel::Config { horizon: horizon.clone(), bedrock_port: bind.port(), public_ip, rtc_port: saved.rtc_port };
+        let checks = !bedrock::allow_unverified();
+        tokio::spawn(async move {
+            if let Err(e) = panel::serve(shown, checks, std::env::var_os("HORIZON_RESTARTED").is_none()).await {
+                eprintln!("Control panel not started (port {} in use?): {e}", panel::PORT);
+            }
+        });
+    }
     webrtc::start(std::net::SocketAddr::new(bind.ip(), rtc_port), public_ip)?;
     match public_ip {
         Some(ip) => println!("WebRTC on udp port {rtc_port}; players outside this network are offered {ip}:{rtc_port}"),
@@ -87,6 +103,8 @@ async fn main() -> std::io::Result<()> {
                     Ok(_) => println!("Horizon at {horizon} is up"),
                     Err(e) => eprintln!("Horizon at {horizon} is unreachable ({e}); retrying every 5 s"),
                 }
+                panel::horizon_up(st.is_ok());
+                panel::event(if st.is_ok() { format!("Horizon at {horizon} is up") } else { format!("Horizon at {horizon} is unreachable") });
                 was_up = Some(st.is_ok());
             }
             if tx.send(st.unwrap_or_else(|_| offline())).is_err() {

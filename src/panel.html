@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HorizonTogether</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6677; --line: #dde1e8; --accent: #2f6fed; --ok: #1f8a4c; --bad: #c2362f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171d; --card: #1d2129; --text: #e7eaf0; --muted: #9aa3b2; --line: #2e3440; --accent: #6b9bff; --ok: #4cc27f; --bad: #ff7468; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+  .pill { font-size: 13px; font-weight: 600; padding: 2px 10px; border-radius: 99px; border: 1px solid currentColor; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+  label { display: block; font-weight: 600; margin: 12px 0 4px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+  input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .row { display: flex; gap: 8px; } .row input { flex: 1; }
+  button { font: inherit; font-weight: 600; padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .actions { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; align-items: center; }
+  #msg { margin: 0; }
+  ul { margin: 0; padding-left: 18px; } li { margin: 2px 0; }
+  #events { font: 13px/1.6 ui-monospace, Consolas, monospace; list-style: none; padding: 0; max-height: 260px; overflow: auto; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; } dt { color: var(--muted); } dd { margin: 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>HorizonTogether <span id="state" class="pill muted">Connecting…</span></h1>
+  <p class="sub">Lets Bedrock Edition players join your Horizon server. This page is only reachable from this computer.</p>
+
+  <section class="card" aria-labelledby="status-h">
+    <h2 id="status-h">Status</h2>
+    <dl>
+      <dt>Horizon server</dt><dd id="horizon">…</dd>
+      <dt>Xbox sign-in checks</dt><dd id="checks">…</dd>
+      <dt>Players connected</dt><dd id="players">…</dd>
+    </dl>
+  </section>
+
+  <section class="card" aria-labelledby="settings-h">
+    <h2 id="settings-h">Settings</h2>
+    <form id="form">
+      <label for="horizon-in">Horizon server address</label>
+      <input id="horizon-in" name="horizon" placeholder="127.0.0.1:25565" required>
+      <p class="hint">Where Horizon runs, as host:port. On the same computer: 127.0.0.1 and Horizon's port.</p>
+
+      <label for="port-in">Bedrock port</label>
+      <input id="port-in" name="bedrock_port" inputmode="numeric" placeholder="19132">
+      <p class="hint">The port Bedrock players enter. Allow it through the firewall (TCP), and forward it on your router for players outside your network.</p>
+
+      <label for="ip-in">Public address (optional)</label>
+      <div class="row">
+        <input id="ip-in" name="public_ip" placeholder="Only needed for players outside your network">
+        <button type="button" id="detect">Detect</button>
+      </div>
+      <p class="hint">Your internet address, offered to players outside your home. Detect asks api.ipify.org.</p>
+
+      <label for="rtc-in">Gameplay port (optional)</label>
+      <input id="rtc-in" name="rtc_port" inputmode="numeric" placeholder="Bedrock port + 1">
+      <p class="hint">The UDP port for gameplay. Forward it on your router too, with the same number inside and out.</p>
+
+      <div class="actions">
+        <button type="submit" class="primary">Save &amp; restart</button>
+        <button type="button" id="quit">Stop the bridge</button>
+        <p id="msg" role="status" aria-live="polite"></p>
+      </div>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="events-h">
+    <h2 id="events-h">Recent activity</h2>
+    <ul id="events"><li class="muted">Nothing yet.</li></ul>
+  </section>
+</main>
+<script>
+const TOKEN = "{{TOKEN}}";
+const $ = (id) => document.getElementById(id);
+let filled = false, restarting = false;
+
+function say(text, cls) { const m = $("msg"); m.textContent = text; m.className = cls || ""; }
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "X-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const data = r.headers.get("Content-Type")?.includes("json") ? await r.json() : { error: await r.text() };
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("/status", { cache: "no-store" })).json();
+    if (restarting) { location.reload(); return; } // the new copy has its own token
+    const state = $("state");
+    state.textContent = "Running"; state.className = "pill ok";
+    $("horizon").innerHTML = "";
+    const h = document.createElement("span");
+    h.textContent = s.config.horizon + (s.horizon_up === true ? " (reachable)" : s.horizon_up === false ? " (not reachable)" : " (checking)");
+    h.className = s.horizon_up === false ? "bad" : s.horizon_up ? "ok" : "muted";
+    $("horizon").append(h);
+    $("checks").textContent = s.sign_in_checks ? "On" : "Off (HORIZON_ALLOW_UNVERIFIED)";
+    $("checks").className = s.sign_in_checks ? "ok" : "bad";
+    $("players").textContent = s.players.length ? s.players.join(", ") : "None";
+    const ev = $("events"); ev.innerHTML = "";
+    for (const e of (s.events.length ? s.events : ["Nothing yet."])) { const li = document.createElement("li"); li.textContent = e; ev.append(li); }
+    if (!filled) {
+      $("horizon-in").value = s.config.horizon; $("port-in").value = s.config.bedrock_port;
+      $("ip-in").value = s.config.public_ip; $("rtc-in").value = s.config.rtc_port ?? "";
+      filled = true;
+    }
+  } catch {
+    const state = $("state");
+    state.textContent = restarting ? "Restarting…" : "Not running"; state.className = "pill " + (restarting ? "muted" : "bad");
+  }
+}
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await post("/config", Object.fromEntries(f.entries()));
+    restarting = true; say("Saved. Restarting the bridge…", "muted");
+  } catch (err) { say(err.message, "bad"); }
+});
+
+$("detect").addEventListener("click", async () => {
+  say("Asking api.ipify.org…", "muted");
+  try { $("ip-in").value = (await post("/detect-ip")).ip; say("Detected. Save to use it.", "ok"); }
+  catch (err) { say("Couldn't detect it: " + err.message, "bad"); }
+});
+
+$("quit").addEventListener("click", async () => {
+  if (!confirm("Stop the bridge? Bedrock players will be disconnected.")) return;
+  try { await post("/quit"); } catch {}
+  say("The bridge has stopped. Start horizon-bedrock again to bring it back.", "muted");
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

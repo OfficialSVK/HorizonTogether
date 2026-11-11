@@ -9,6 +9,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Area | State | Where |
 |---|---|---|
 | Server list | The Bedrock client shows the bridge's name and live player count, taken from Horizon's Java status ping. Both NetherNet (`GET /v1/join`) and RakNet pong are answered. | `src/main.rs`, `src/java.rs`, `src/nethernet.rs` |
+| Control panel | Started with no arguments, the bridge serves a settings and status page on http://127.0.0.1:8150 and opens it in the browser: Horizon's address, the Bedrock and gameplay ports and the public address (saved to `horizontogether.json`; Save & restart), Horizon's state, sign-in checks, connected players and recent logins. Changes need the page's token and a local Host. | `src/panel.rs`, `src/panel.html` |
 | NetherNet signaling | HTTP `POST /v1/join/{id}` takes the client's SDP offer and returns our answer. HTTPS probes are refused immediately so the client falls back to HTTP fast. | `src/nethernet.rs` |
 | WebRTC transport | `str0m` (pure-Rust crypto, no OpenSSL): ICE-lite, DTLS, SCTP data channels. Every player shares one UDP port (the Bedrock port + 1, `HORIZON_RTC_PORT`), routed by ICE username, and `HORIZON_PUBLIC_IP` is offered to players outside the local network: verified joining from mobile data through router port forwarding. Segmented messages are reassembled, sends are queued with backpressure, and idle connections time out. | `src/webrtc.rs` |
 | Server identity | The answer carries a signed `a=identity` (self-signed ES384, domain `self`, like BDS). Without it the client silently ignores the answer. | `src/identity.rs` |
@@ -29,7 +30,7 @@ All of this was verified with a real **Minecraft Bedrock 26.60 client (Windows, 
 | Health and death | Health, hunger and fall damage come from Horizon. On death the bridge respawns the player at once (there is no death screen yet). | `src/bedrock.rs`, `src/java.rs` |
 | Weather and time | Rain, thunder and the time of day follow Horizon. | `src/bedrock.rs`, `src/java.rs` |
 
-There are 54 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
+There are 56 unit tests (`cargo test`). They cover the packet encoders, the join state machine (using bytes captured from the real client), segmentation, the identity signatures, and the Java status ping against a fake server.
 
 ## Known limitations
 
