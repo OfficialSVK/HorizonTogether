@@ -1,6 +1,6 @@
 [package]
 name = "horizon-bedrock"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "Lets Minecraft Bedrock Edition players join a Horizon (Java Edition 26.3) server"
